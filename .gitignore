@@ -21,6 +21,7 @@ htmlcov/
 *.egg-info/
 dist/
 build/
+cmake/
 .eggs/
 
 # Editors
