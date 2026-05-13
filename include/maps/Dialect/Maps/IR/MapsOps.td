@@ -19,8 +19,8 @@ def StageOp : Maps_Op<"stage", [SingleBlock, NoTerminator]>{
         A stage operation represents a single stage in a pipeline. 
     }];
     let arguments = (ins
-        SymbolNameAttr:$sym_name,
-        I64Attr:$stage_id);
+        I64Attr:$stage_id,
+        SymbolNameAttr:$sym_name);
 
     let regions = (region SizedRegion<1>:$body);
 
@@ -32,7 +32,8 @@ def StageOp : Maps_Op<"stage", [SingleBlock, NoTerminator]>{
 
 }
 
-def TileOp : Maps_Op<"tile", [SingleBlockImplicitTerminator<"ReturnOp">]>{
+
+def TileOp : Maps_Op<"tile", [SingleBlock, NoTerminator]>{
     let summary = "A tile operation";
 
     let description = [{
@@ -54,26 +55,91 @@ def TileOp : Maps_Op<"tile", [SingleBlockImplicitTerminator<"ReturnOp">]>{
     }];
 }
 
-def InitOp : Maps_Op<"init">{
+def InitOp : Maps_Op<"init", [SingleBlock,NoTerminator]>{
     let summary = "An init operation";
+
+    let regions = (region SizedRegion<1>:$body);
+
+    let assemblyFormat = [{
+
+        attr-dict-with-keyword $body
+    }];
 }
 
-def ReadOp : Maps_Op<"read">{
+
+def ReadOp : Maps_Op<"read",[AllTypesMatch<["input","result"]>]>{
     let summary = "A read operation";
+
+    let arguments = (ins
+        AnyType:$input
+    );
+
+    let results = (outs
+        AnyType:$result
+    );
+
+    let assemblyFormat = [{
+        $input attr-dict `:` type($input)
+    }];
+
 }
 
-def SendOp : Maps_Op<"send">{
-    let summary = "A send operation";
+
+def RecvOp : Maps_Op<"recv"> {
+  let summary = "Receive a value from a MAPS channel";
+
+  let description = [{
+    The `maps.recv` operation receives a value from a named MAPS
+    communication channel.
+
+    Example:
+
+    ```mlir
+    %value = maps.recv @channel {src_hartid = 0 : i64}
+      : tensor<64x22xf32>
+    ```
+  }];
+
+  let arguments = (ins
+    FlatSymbolRefAttr:$channel,
+    I64Attr:$src_hartid
+  );
+
+  let results = (outs
+    AnyType:$result
+  );
+
+  let assemblyFormat = [{
+    $channel attr-dict `:` type($result)
+  }];
 }
 
-def RecieveOp : Maps_Op<"recv">{
-    let summary = "A recieve operation";
+
+def SendOp : Maps_Op<"send"> {
+  let summary = "Send a value through a MAPS channel";
+
+  let description = [{
+    The `maps.send` operation sends an SSA value through a named MAPS
+    communication channel.
+
+    Example:
+
+    ```mlir
+    maps.send %value, @channel {dst_hartid = 8 : i64}
+      : tensor<64x22xf32>
+    ```
+  }];
+
+  let arguments = (ins
+    AnyType:$value,
+    FlatSymbolRefAttr:$channel,
+    I64Attr:$dst_hartid
+  );
+
+  let assemblyFormat = [{
+    $value `,` $channel attr-dict `:` type($value)
+  }];
 }
 
-def ReturnOp : Maps_Op<"return", [Terminator]>{
-    let summary = "A return operation";
-
-    let assemblyFormat = "attr-dict";
-}
 
 #endif // MAPS_OPS
