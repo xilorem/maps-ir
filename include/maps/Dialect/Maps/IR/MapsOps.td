@@ -32,8 +32,26 @@ def StageOp : Maps_Op<"stage", [SingleBlock, NoTerminator]>{
 
 }
 
-def TileOp : Maps_Op<"tile">{
+def TileOp : Maps_Op<"tile", [SingleBlockImplicitTerminator<"ReturnOp">]>{
     let summary = "A tile operation";
+
+    let description = [{
+        A tile operation represents a single tile in a pipeline. 
+    }];
+
+    let arguments = (ins
+        SymbolNameAttr:$sym_name,
+        I64Attr:$tile_id,
+        DenseI64ArrayAttr:$coords
+    );
+
+    let regions = (region SizedRegion<1>:$body);
+
+    // let hasVerifier = 1;
+
+    let assemblyFormat = [{
+        $sym_name attr-dict-with-keyword $body
+    }];
 }
 
 def InitOp : Maps_Op<"init">{
@@ -52,8 +70,10 @@ def RecieveOp : Maps_Op<"recv">{
     let summary = "A recieve operation";
 }
 
-def ReturnOp : Maps_Op<"return">{
+def ReturnOp : Maps_Op<"return", [Terminator]>{
     let summary = "A return operation";
+
+    let assemblyFormat = "attr-dict";
 }
 
 #endif // MAPS_OPS
