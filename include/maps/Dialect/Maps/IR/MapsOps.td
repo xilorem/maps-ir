@@ -67,24 +67,6 @@ def InitOp : Maps_Op<"init", [SingleBlock,NoTerminator]>{
 }
 
 
-def ReadOp : Maps_Op<"read",[AllTypesMatch<["input","result"]>]>{
-    let summary = "A read operation";
-
-    let arguments = (ins
-        AnyType:$input
-    );
-
-    let results = (outs
-        AnyType:$result
-    );
-
-    let assemblyFormat = [{
-        $input attr-dict `:` type($input)
-    }];
-
-}
-
-
 def RecvOp : Maps_Op<"recv"> {
   let summary = "Receive a value from a MAPS channel";
 
