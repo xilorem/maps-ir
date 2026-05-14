@@ -11,8 +11,11 @@
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/Tools/mlir-translate/Translation.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/ADT/DenseMap.h"
+
 
 using namespace mlir;
 
@@ -22,7 +25,8 @@ namespace mlir::maps {
 static Type parseElementType(const llvm::json::Object &tensor,
                              OpBuilder &builder) {
     std::optional<StringRef> dtype = tensor.getString("dtype");
-
+    
+    // fallback to f32 if dtype is not specified, still need to add it in the maps tool
     if (!dtype)
         return builder.getF32Type();
 
@@ -50,25 +54,68 @@ static Type parseElementType(const llvm::json::Object &tensor,
 
 static RankedTensorType parseTensorType(const llvm::json::Object &tensor,
                                         OpBuilder &builder) {
-    auto *dimsJson = tensor.getArray("dims");
-    if (!dimsJson)
-        return {};
 
+    // e.g. %A: tensor<64x128xf16>
+
+    // get tensor dimensions
+    auto *dimsJson = tensor.getArray("dims");
     SmallVector<int64_t> dims;
 
     for (const llvm::json::Value &dimJson : *dimsJson) {
         std::optional<int64_t> dim = dimJson.getAsInteger();
         if (!dim)
-        return {};
+            return {};
 
         dims.push_back(*dim);
     }
 
+    // get tensor element type
     Type elementType = parseElementType(tensor, builder);
     if (!elementType)
         return {};
 
     return RankedTensorType::get(dims, elementType);
+}
+
+
+static std::optional<llvm::SetVector<int64_t>> collectExtOutputTensorIds(const llvm::json::Array &stages){
+    
+    // to get the output tensors, we check if a tensor is produced but never consumed
+    llvm::SetVector<int64_t> produced;
+    llvm::SetVector<int64_t> consumed;
+    llvm::SetVector<int64_t> ids;
+
+    for (const llvm::json::Value &stageValue : stages) {
+        auto *stage = stageValue.getAsObject();
+        auto *layers = stage->getArray("layers");
+
+        for (const llvm::json::Value &layerValue : *layers) {
+            auto *layer = layerValue.getAsObject();
+            auto *inputs = layer->getArray("inputs");
+            auto *outputs = layer->getArray("outputs");
+
+            for (const llvm::json::Value &inputValue : *inputs){
+                auto *input = inputValue.getAsObject();
+                std::optional<int64_t> tensorId = input->getInteger("tensor_id");
+                if (tensorId)
+                    consumed.insert(*tensorId);
+            }
+
+            for (const llvm::json::Value &outputValue : *outputs){
+                auto *output = outputValue.getAsObject();
+                std::optional<int64_t> tensorId = output->getInteger("tensor_id");
+                if (tensorId)
+                    produced.insert(*tensorId);
+            }
+        }
+    }
+
+    for (int64_t tensorId : produced) {
+        if (!consumed.contains(tensorId))
+            ids.insert(tensorId);
+    }
+
+    return ids;
 }
 
 
@@ -134,19 +181,49 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
         auto *tensor = (*tensors)[tensorId].getAsObject();
         RankedTensorType type = parseTensorType(*tensor, builder);
         inputTypes.push_back(type);
-  }
+    }
 
-  builder.setInsertionPointToStart(module.getBody());
+    // create main function
+    builder.setInsertionPointToStart(module.getBody());
 
-  FunctionType funcType = builder.getFunctionType(inputTypes, {});
-  func::FuncOp mainFunc = func::FuncOp::create(builder, loc, "main", funcType);
+    FunctionType funcType = builder.getFunctionType(inputTypes, {});
+    func::FuncOp mainFunc = func::FuncOp::create(builder, loc, "main", funcType);
 
-  Block *entry = mainFunc.addEntryBlock();
-  builder.setInsertionPointToStart(entry);
+    Block *mainEntry = mainFunc.addEntryBlock();
 
-  func::ReturnOp::create(builder, loc);
+    // start of main block
+    builder.setInsertionPointToStart(mainEntry);
 
-  return OwningOpRef<Operation *>(module.getOperation());
+    // create empty tensors for output tensors
+    auto extOutputTensorIds = *collectExtOutputTensorIds(*stages);
+    llvm::DenseMap<int64_t, Value> OutputTensorInitValues;
+
+    for (int64_t tensorId : extOutputTensorIds) {
+        auto *tensor = (*tensors)[tensorId].getAsObject();
+        RankedTensorType type = parseTensorType(*tensor, builder);
+        auto emptyTensor = tensor::EmptyOp::create(builder, loc,type.getShape(), type.getElementType());
+        OutputTensorInitValues[tensorId] = emptyTensor.getResult();
+    }
+
+
+    // start of init block for data movement of initializers inside tiles
+    auto init = InitOp::create(builder, loc);
+    builder.setInsertionPointToStart(&init.getBody().front());
+
+
+    // if no initializers exist (idk how but hey) add this to place a fake block
+    if (init.getBody().empty())
+        init.getBody().emplaceBlock();
+
+    // end of init region
+    builder.setInsertionPointAfter(init);
+
+
+
+    // place main's return op at the end of the block
+    func::ReturnOp::create(builder, loc);
+
+    return OwningOpRef<Operation *>(module.getOperation());
 }
 
 void registerJsonToMapsTranslation() {
