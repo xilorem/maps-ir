@@ -15,11 +15,27 @@
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
+
 
 
 using namespace mlir;
 
 namespace mlir::maps {
+
+
+struct SliceDim {
+    int64_t start;
+    int64_t length;
+};
+
+struct Fragment {
+    int64_t tensorId;
+    int64_t srcHartId;
+    int64_t dstHartId;
+    SmallVector<SliceDim> srcDims;
+    SmallVector<SliceDim> dstDims;
+};
 
 
 static Type parseElementType(const llvm::json::Object &tensor,
@@ -119,6 +135,57 @@ static std::optional<llvm::SetVector<int64_t>> collectExtOutputTensorIds(const l
 }
 
 
+static std::optional<SmallVector<SliceDim>> parseSliceDims(const llvm::json::Object &slice) {
+    SmallVector<SliceDim> result;
+    auto rank = slice.getInteger("rank");
+    auto *dims = slice.getArray("dims");
+
+    for (const llvm::json::Value &dimValue : *dims) {
+        auto *dim = dimValue.getAsObject();
+        auto start = dim->getInteger("start");
+        auto length = dim->getInteger("length");
+
+        result.push_back({*start, *length});
+    }
+    return result;
+}
+
+
+static std::optional<SmallVector<Fragment>> getInitFragments(const llvm::json::Array &initializations) {
+    SmallVector<Fragment> result;
+    
+    for (const llvm::json::Value &initValue : initializations) {
+        auto *init = initValue.getAsObject();
+
+        auto tensorId = init->getInteger("tensor_id");
+        auto *fragments = init->getArray("fragments");
+
+        for (const llvm::json::Value &fragmentValue : *fragments) {
+            auto *fragment = fragmentValue.getAsObject();
+            if (!fragment)
+                return std::nullopt;
+
+            auto srcHartId = fragment->getInteger("src_hartid");
+            auto dstHartId = fragment->getInteger("dst_hartid");
+            auto *srcSlice = fragment->getObject("src_slice");
+            auto *dstSlice = fragment->getObject("dst_slice");
+
+            auto srcDims = parseSliceDims(*srcSlice);
+            auto dstDims = parseSliceDims(*dstSlice);
+
+            result.push_back(Fragment{
+                *tensorId,
+                *srcHartId,
+                *dstHartId,
+                *srcDims,
+                *dstDims,
+            });
+        }
+    }
+    return result;
+  }
+
+
 static std::optional<llvm::SetVector<int64_t>> collectInputTensorIds(const llvm::json::Array &stages){
 
     llvm::SetVector<int64_t> ids;
@@ -208,17 +275,55 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
 
     // start of init block for data movement of initializers inside tiles
     auto init = InitOp::create(builder, loc);
+    init.getBody().emplaceBlock();
     builder.setInsertionPointToStart(&init.getBody().front());
 
+    // obtain initializer fragments from json
+    auto *initializations = root->getArray("initializations");
+    auto initFragments = getInitFragments(*initializations);
 
-    // if no initializers exist (idk how but hey) add this to place a fake block
-    if (init.getBody().empty())
-        init.getBody().emplaceBlock();
+    // map input tensor ids to main function arguments
+    llvm::DenseMap<int64_t, Value> inputTensorValues;
+    for (auto indexed : llvm::enumerate(inputTensorIds)) {
+        int64_t argIndex = indexed.index();
+        int64_t tensorId = indexed.value();
+        inputTensorValues[tensorId] = mainEntry->getArgument(argIndex);
+    }
+
+    // extract slices from input tensors for each fragment
+    for (const Fragment &fragment : *initFragments) {
+        Value source = inputTensorValues.lookup(fragment.tensorId);
+        
+        SmallVector<int64_t> shape;
+        SmallVector<OpFoldResult> offsets;
+        SmallVector<OpFoldResult> sizes;
+        SmallVector<OpFoldResult> strides;
+
+        for (const SliceDim &dim : fragment.srcDims) {
+            shape.push_back(dim.length);
+            offsets.push_back(builder.getIndexAttr(dim.start));
+            sizes.push_back(builder.getIndexAttr(dim.length));
+            strides.push_back(builder.getIndexAttr(1));
+        }
+
+
+        auto sourceType = cast<RankedTensorType>(source.getType());
+        auto sliceType = RankedTensorType::get(shape, sourceType.getElementType());
+
+        Value slice = tensor::ExtractSliceOp::create(
+            builder, 
+            loc, 
+            sliceType, 
+            source, 
+            offsets, 
+            sizes, 
+            strides
+        );
+
+    }
 
     // end of init region
     builder.setInsertionPointAfter(init);
-
-
 
     // place main's return op at the end of the block
     func::ReturnOp::create(builder, loc);
