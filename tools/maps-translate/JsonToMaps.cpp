@@ -50,6 +50,11 @@ struct Tile{
     int64_t y;
 };
 
+struct Stage {
+    int64_t stageId;
+    std::string symName;
+};
+
 
 
 static Type parseElementType(const llvm::json::Object &tensor,
@@ -219,6 +224,27 @@ static std::optional<SmallVector<Tile>> getTileObjs(const llvm::json::Array &til
             *y
         });
     }
+    return result;
+}
+
+
+static std::optional<SmallVector<Stage>>getStageObjs(const llvm::json::Array &stages) {
+    SmallVector<Stage> result;
+
+    // TODO: need to add stage index 
+    for (auto indexed : llvm::enumerate(stages)) {
+        auto *stage = indexed.value().getAsObject();
+        if (!stage)
+            return std::nullopt;
+
+        std::string symName = ("stage" + std::to_string(indexed.index()));
+
+        result.push_back(Stage{
+            static_cast<int64_t>(indexed.index()),
+            symName,
+        });
+    }
+
     return result;
 }
 
@@ -394,7 +420,12 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
                 continue; // tile doesn't receive this fragment
 
             auto *tensor = (*tensors)[fragment.tensorId].getAsObject();
-            Type resultType = parseTensorType(*tensor, builder);
+            SmallVector<int64_t> shape;
+            for (const SliceDim &dim : fragment.dstDims)
+                shape.push_back(dim.length);
+
+            Type elementType = parseElementType(*tensor, builder);
+            Type resultType = RankedTensorType::get(shape, elementType);
 
             // create recv op for the fragment
             maps::RecvOp::create(
@@ -414,6 +445,35 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
 
     // end of init region
     builder.setInsertionPointAfter(init);
+
+
+    // start of run region
+    auto run = RunOp::create(builder, loc);
+    run.getBody().emplaceBlock();
+    builder.setInsertionPointToStart(&run.getBody().front());
+
+
+    // start of stages regions
+    auto stageObjs = getStageObjs(*stages);
+
+    for (const Stage &stageObj : *stageObjs) {
+
+        auto stage = StageOp::create(
+        builder,
+        loc,
+        builder.getI64IntegerAttr(stageObj.stageId),
+        builder.getStringAttr(stageObj.symName)
+    );
+        stage.getBody().emplaceBlock();
+        builder.setInsertionPointToStart(&stage.getBody().front());
+
+
+
+        builder.setInsertionPointAfter(stage);
+    }
+
+    builder.setInsertionPointAfter(run);
+    // end of run region
 
     // place main's return op at the end of the block
     func::ReturnOp::create(builder, loc);

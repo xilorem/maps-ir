@@ -67,7 +67,7 @@ def InitOp : Maps_Op<"init", [SingleBlock,NoTerminator]>{
 }
 
 
-def runOp : Maps_Op<"run", [SingleBlock,NoTerminator]>{
+def RunOp : Maps_Op<"run", [SingleBlock,NoTerminator]>{
     let summary = "A run operation";
 
     let regions = (region SizedRegion<1>:$body);
