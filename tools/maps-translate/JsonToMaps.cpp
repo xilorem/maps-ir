@@ -44,6 +44,13 @@ struct Fragment {
     SmallVector<SliceDim> dstDims;
 };
 
+struct Tile{
+    int64_t hartId;
+    int64_t x;
+    int64_t y;
+};
+
+
 
 static Type parseElementType(const llvm::json::Object &tensor,
                              OpBuilder &builder) {
@@ -194,7 +201,26 @@ static std::optional<SmallVector<Fragment>> getInitFragments(const llvm::json::A
         }
     }
     return result;
-  }
+}
+
+
+static std::optional<SmallVector<Tile>> getTileObjs(const llvm::json::Array &tiles) {
+    SmallVector<Tile> result;
+    
+    for (const llvm::json::Value &tileValue : tiles) {
+        auto *tile = tileValue.getAsObject();
+
+        auto tileId = tile->getInteger("tile_id");
+        auto x = tile->getInteger("x");
+        auto y = tile->getInteger("y");
+        result.push_back(Tile{
+            *tileId,
+            *x,
+            *y
+        });
+    }
+    return result;
+}
 
 
 static std::optional<llvm::SetVector<int64_t>> collectInputTensorIds(const llvm::json::Array &stages){
@@ -341,9 +367,50 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
             builder.getI64IntegerAttr(fragment.srcHartId),
             builder.getI64IntegerAttr(fragment.dstHartId)
         );
-
-
     }
+
+    // start of tiles receiving init data
+    auto *mesh = root->getObject("mesh");
+    auto *tiles = mesh->getArray("tiles");
+    auto tileObjs = getTileObjs(*tiles);
+
+    for (const Tile &tileObj : *tileObjs) {
+
+        auto tile = TileOp::create(
+            builder,
+            loc,
+            builder.getStringAttr("tile" + std::to_string(tileObj.hartId)),
+            builder.getI64IntegerAttr(tileObj.hartId),
+            builder.getDenseI64ArrayAttr({tileObj.x, tileObj.y})
+        );
+
+        // start tile block
+        tile.getBody().emplaceBlock();
+        builder.setInsertionPointToStart(&tile.getBody().front());
+
+        // check which tiles receive which fragments
+        for (const Fragment &fragment : *initFragments) {
+            if (fragment.dstHartId != tileObj.hartId)
+                continue; // tile doesn't receive this fragment
+
+            auto *tensor = (*tensors)[fragment.tensorId].getAsObject();
+            Type resultType = parseTensorType(*tensor, builder);
+
+            // create recv op for the fragment
+            maps::RecvOp::create(
+                builder,
+                loc,
+                resultType,
+                StringRef(fragment.name),
+                fragment.srcHartId,
+                fragment.dstHartId
+            );
+        }
+
+        builder.setInsertionPointAfter(tile);
+        // end of tile block
+    }
+    // end of tiles receiving init data
 
     // end of init region
     builder.setInsertionPointAfter(init);
