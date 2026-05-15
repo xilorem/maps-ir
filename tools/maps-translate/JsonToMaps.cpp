@@ -19,7 +19,7 @@
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
 
-// Astract data types
+// Abstract data types
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
@@ -52,22 +52,22 @@ static Type parseElementType(const llvm::json::Object &tensor,
     if (!dtype)
         return builder.getF32Type();
 
-    if (*dtype == "f32" || *dtype == "float32")
+    if (*dtype == "f32" || *dtype == "float32" || *dtype == "fp32")
         return builder.getF32Type();
 
-    if (*dtype == "f64" || *dtype == "float64")
+    if (*dtype == "f64" || *dtype == "float64" || *dtype == "fp64")
         return builder.getF64Type();
 
-    if (*dtype == "f16" || *dtype == "float16")
+    if (*dtype == "f16" || *dtype == "float16" || *dtype == "fp16")
         return builder.getF16Type();
 
-    if (*dtype == "bf16")
+    if (*dtype == "bf16" || *dtype == "brainfloat16")
         return builder.getBF16Type();
 
-    if (*dtype == "i32")
+    if (*dtype == "i32" || *dtype == "int32" || *dtype == "integer32")
         return builder.getI32Type();
 
-    if (*dtype == "i64")
+    if (*dtype == "i64" || *dtype == "int64" || *dtype == "integer64")
         return builder.getI64Type();
 
     return {};
