@@ -67,6 +67,18 @@ def InitOp : Maps_Op<"init", [SingleBlock,NoTerminator]>{
 }
 
 
+def runOp : Maps_Op<"run", [SingleBlock,NoTerminator]>{
+    let summary = "A run operation";
+
+    let regions = (region SizedRegion<1>:$body);
+
+    let assemblyFormat = [{
+
+        attr-dict-with-keyword $body
+    }];
+}
+
+
 def RecvOp : Maps_Op<"recv"> {
   let summary = "Receive a value from a MAPS channel";
 
