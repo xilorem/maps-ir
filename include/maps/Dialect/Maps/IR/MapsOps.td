@@ -84,19 +84,21 @@ def RecvOp : Maps_Op<"recv"> {
 
   let description = [{
     The `maps.recv` operation receives a value from a named MAPS
-    communication channel.
+    communication channel. The `src_hartid` attribute names the sending hart,
+    while `dst_hartid` names the receiving hart; `-1` denotes L2.
 
     Example:
 
     ```mlir
-    %value = maps.recv @channel {src_hartid = 0 : i64}
+    %value = maps.recv @channel {src_hartid = 0 : i64, dst_hartid = 8 : i64}
       : tensor<64x22xf32>
     ```
   }];
 
   let arguments = (ins
     FlatSymbolRefAttr:$channel,
-    I64Attr:$src_hartid
+    I64Attr:$src_hartid,
+    I64Attr:$dst_hartid
   );
 
   let results = (outs
@@ -114,7 +116,8 @@ def SendOp : Maps_Op<"send"> {
 
   let description = [{
     The `maps.send` operation sends an SSA value through a named MAPS
-    communication channel.
+    communication channel. The `src_hartid` attribute names the sending hart;
+    `src_hartid = -1` denotes data sourced from L2.
 
     Example:
 
