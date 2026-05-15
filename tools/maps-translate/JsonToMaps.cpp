@@ -1,28 +1,34 @@
-#include "maps/Dialect/Maps/IR/Maps.h"
+// Translation registration function
+#include "mlir/Tools/mlir-translate/Translation.h"
 
+// Dialects
+#include "maps/Dialect/Maps/IR/Maps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+
+// IR constructs
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/OwningOpRef.h"
-#include "mlir/Tools/mlir-translate/Translation.h"
-#include "llvm/ADT/SetVector.h"
-#include "llvm/ADT/DenseSet.h"
+
+// JSON parsing
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
+
+// Astract data types
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
-
+#include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/DenseSet.h"
 
 
 using namespace mlir;
 
 namespace mlir::maps {
-
 
 struct SliceDim {
     int64_t start;
@@ -42,7 +48,7 @@ static Type parseElementType(const llvm::json::Object &tensor,
                              OpBuilder &builder) {
     std::optional<StringRef> dtype = tensor.getString("dtype");
     
-    // fallback to f32 if dtype is not specified, still need to add it in the maps tool
+    // fallback to f32 if dtype is not specified, TODO: need to add it in the maps tool
     if (!dtype)
         return builder.getF32Type();
 
