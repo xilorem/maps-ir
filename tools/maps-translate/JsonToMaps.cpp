@@ -36,6 +36,7 @@ struct SliceDim {
 };
 
 struct Fragment {
+    std::string name;
     int64_t tensorId;
     int64_t srcHartId;
     int64_t dstHartId;
@@ -143,7 +144,7 @@ static std::optional<llvm::SetVector<int64_t>> collectExtOutputTensorIds(const l
 
 static std::optional<SmallVector<SliceDim>> parseSliceDims(const llvm::json::Object &slice) {
     SmallVector<SliceDim> result;
-    auto rank = slice.getInteger("rank");
+    // auto rank = slice.getInteger("rank");
     auto *dims = slice.getArray("dims");
 
     for (const llvm::json::Value &dimValue : *dims) {
@@ -165,21 +166,25 @@ static std::optional<SmallVector<Fragment>> getInitFragments(const llvm::json::A
 
         auto tensorId = init->getInteger("tensor_id");
         auto *fragments = init->getArray("fragments");
+        auto name = init->getString("name");
 
         for (const llvm::json::Value &fragmentValue : *fragments) {
             auto *fragment = fragmentValue.getAsObject();
             if (!fragment)
                 return std::nullopt;
-
+            
+            
             auto srcHartId = fragment->getInteger("src_hartid");
             auto dstHartId = fragment->getInteger("dst_hartid");
             auto *srcSlice = fragment->getObject("src_slice");
             auto *dstSlice = fragment->getObject("dst_slice");
+            auto fragName = (name->str() + "_from_L2_to_tile" + std::to_string(*dstHartId));
 
             auto srcDims = parseSliceDims(*srcSlice);
             auto dstDims = parseSliceDims(*dstSlice);
 
             result.push_back(Fragment{
+                fragName,
                 *tensorId,
                 *srcHartId,
                 *dstHartId,
@@ -316,6 +321,7 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
         auto sourceType = cast<RankedTensorType>(source.getType());
         auto sliceType = RankedTensorType::get(shape, sourceType.getElementType());
 
+        // create extract_slice op for the fragment, considering tile usage
         Value slice = tensor::ExtractSliceOp::create(
             builder, 
             loc, 
@@ -325,6 +331,17 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
             sizes, 
             strides
         );
+
+        // create send op for initializers fragments
+        maps::SendOp::create(
+            builder, 
+            loc, 
+            slice, 
+            SymbolRefAttr::get(ctx, fragment.name),
+            builder.getI64IntegerAttr(fragment.srcHartId),
+            builder.getI64IntegerAttr(fragment.dstHartId)
+        );
+
 
     }
 
