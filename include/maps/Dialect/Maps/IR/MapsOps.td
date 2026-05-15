@@ -107,7 +107,7 @@ def SendOp : Maps_Op<"send"> {
     Example:
 
     ```mlir
-    maps.send %value, @channel {dst_hartid = 8 : i64}
+    maps.send %value, @channel {src_hartid = 0 : i64, dst_hartid = 8 : i64}
       : tensor<64x22xf32>
     ```
   }];
@@ -115,6 +115,7 @@ def SendOp : Maps_Op<"send"> {
   let arguments = (ins
     AnyType:$value,
     FlatSymbolRefAttr:$channel,
+    I64Attr:$src_hartid,
     I64Attr:$dst_hartid
   );
 
