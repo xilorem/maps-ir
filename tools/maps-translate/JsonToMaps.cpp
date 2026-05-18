@@ -44,6 +44,15 @@ struct Fragment {
     SmallVector<SliceDim> dstDims;
 };
 
+struct TransitionFragment {
+    std::string name;
+    int64_t tensorId;
+    int64_t srcHartId;
+    int64_t dstHartId;
+    SmallVector<SliceDim> srcDims;
+    SmallVector<SliceDim> dstDims;
+};
+
 struct Tile{
     int64_t hartId;
     int64_t x;
@@ -100,6 +109,70 @@ static bool isTileInStage(const Tile &tile, const Stage &stage) {
            tile.x < stage.x0 + stage.width &&
            tile.y >= stage.y0 &&
            tile.y < stage.y0 + stage.height;
+}
+
+
+static std::optional<int64_t> getTensorId(const llvm::json::Value &value) {
+    auto *object = value.getAsObject();
+    if (!object)
+        return std::nullopt;
+    return object->getInteger("tensor_id");
+}
+
+
+static SmallVector<int64_t> getLocalStartsForSourceTile(ArrayRef<TransitionFragment> fragments,
+                                                        const TransitionFragment &selected) {
+    SmallVector<int64_t> starts;
+    starts.reserve(selected.srcDims.size());
+    for (const SliceDim &dim : selected.srcDims)
+        starts.push_back(dim.start);
+
+    for (const TransitionFragment &fragment : fragments) {
+        if (fragment.tensorId != selected.tensorId ||
+            fragment.srcHartId != selected.srcHartId ||
+            fragment.srcDims.size() != starts.size())
+            continue;
+
+        for (auto indexed : llvm::enumerate(fragment.srcDims))
+            starts[indexed.index()] = std::min(starts[indexed.index()], indexed.value().start);
+    }
+
+    return starts;
+}
+
+
+static unsigned getConcatDim(ArrayRef<TransitionFragment> fragments) {
+    if (fragments.empty())
+        return 0;
+
+    for (auto indexed : llvm::enumerate(fragments.front().dstDims)) {
+        int64_t start = indexed.value().start;
+        bool differs = llvm::any_of(fragments, [&](const TransitionFragment &fragment) {
+            return fragment.dstDims[indexed.index()].start != start;
+        });
+        if (differs)
+            return indexed.index();
+    }
+
+    return 0;
+}
+
+
+static SmallVector<int64_t> getTensorShape(const llvm::json::Object &tensor) {
+    SmallVector<int64_t> shape;
+    auto *dims = tensor.getArray("dims");
+    for (const llvm::json::Value &dimValue : *dims)
+        shape.push_back(*dimValue.getAsInteger());
+    return shape;
+}
+
+
+static SliceDim partitionDim(int64_t size, int64_t parts, int64_t index) {
+    int64_t base = size / parts;
+    int64_t remainder = size % parts;
+    int64_t length = base + (index < remainder ? 1 : 0);
+    int64_t start = index * base + std::min(index, remainder);
+    return {start, length};
 }
 
 
@@ -225,6 +298,47 @@ static std::optional<SmallVector<Fragment>> getInitFragments(const llvm::json::A
 }
 
 
+static std::optional<SmallVector<TransitionFragment>> getTransitionFragments(const llvm::json::Array &transitions) {
+    SmallVector<TransitionFragment> result;
+    
+    for (const llvm::json::Value &transitionValue : transitions) {
+        auto *transition = transitionValue.getAsObject();
+        if (!transition)
+            return std::nullopt;
+
+        auto tensorId = transition->getInteger("tensor_id");
+        auto *fragments = transition->getArray("fragments");
+        auto name = transition->getString("name");
+
+        for (const llvm::json::Value &fragmentValue : *fragments) {
+            auto *fragment = fragmentValue.getAsObject();
+            if (!fragment)
+                return std::nullopt;
+            
+            auto srcHartId = fragment->getInteger("src_hartid");
+            auto dstHartId = fragment->getInteger("dst_hartid");
+            auto *srcSlice = fragment->getObject("src_slice");
+            auto *dstSlice = fragment->getObject("dst_slice");
+            auto fragName = (name->str() + "_from_tile" + std::to_string(*srcHartId) +
+                             "_to_tile" + std::to_string(*dstHartId));
+
+            auto srcDims = parseSliceDims(*srcSlice);
+            auto dstDims = parseSliceDims(*dstSlice);
+
+            result.push_back(TransitionFragment{
+                fragName,
+                *tensorId,
+                *srcHartId,
+                *dstHartId,
+                *srcDims,
+                *dstDims,
+            });
+        }
+    }
+    return result;
+}
+
+
 static std::optional<SmallVector<Tile>> getTileObjs(const llvm::json::Array &tiles) {
     SmallVector<Tile> result;
     
@@ -268,6 +382,80 @@ static std::optional<SmallVector<Stage>>getStageObjs(const llvm::json::Array &st
             *width,
             *height,
         });
+    }
+
+    return result;
+}
+
+
+static SmallVector<TransitionFragment> getOutputFragments(const llvm::json::Array &stages,
+                                                          const llvm::json::Array &tensors,
+                                                          const SmallVector<Tile> &tiles,
+                                                          const llvm::SetVector<int64_t> &outputTensorIds) {
+    SmallVector<TransitionFragment> result;
+
+    for (const llvm::json::Value &stageValue : stages) {
+        auto *stage = stageValue.getAsObject();
+        auto *layers = stage->getArray("layers");
+
+        for (const llvm::json::Value &layerValue : *layers) {
+            auto *layer = layerValue.getAsObject();
+            auto *outputs = layer->getArray("outputs");
+
+            for (const llvm::json::Value &outputValue : *outputs) {
+                auto *output = outputValue.getAsObject();
+                auto tensorId = output->getInteger("tensor_id");
+                if (!tensorId || !outputTensorIds.contains(*tensorId))
+                    continue;
+
+                auto *tensor = tensors[*tensorId].getAsObject();
+                SmallVector<int64_t> tensorShape = getTensorShape(*tensor);
+                auto tensorName = tensor->getString("name");
+
+                auto *layout = output->getObject("layout");
+                auto *submesh = layout->getObject("submesh");
+                int64_t x0 = *submesh->getInteger("x0");
+                int64_t y0 = *submesh->getInteger("y0");
+                int64_t width = *submesh->getInteger("width");
+                int64_t height = *submesh->getInteger("height");
+
+                auto *meshX = layout->getObject("mesh_x");
+                auto *meshY = layout->getObject("mesh_y");
+                int64_t logicalWidth = *layout->getInteger("logical_width");
+                int64_t logicalHeight = *layout->getInteger("logical_height");
+
+                for (const Tile &tile : tiles) {
+                    if (tile.x < x0 || tile.x >= x0 + width ||
+                        tile.y < y0 || tile.y >= y0 + height)
+                        continue;
+
+                    SmallVector<SliceDim> dims;
+                    dims.reserve(tensorShape.size());
+                    for (int64_t dim : tensorShape)
+                        dims.push_back({0, dim});
+
+                    if (*meshX->getInteger("mode") == 1) {
+                        int64_t axis = *meshX->getInteger("tensor_axis");
+                        dims[axis] = partitionDim(tensorShape[axis], logicalWidth, tile.x - x0);
+                    }
+                    if (*meshY->getInteger("mode") == 1) {
+                        int64_t axis = *meshY->getInteger("tensor_axis");
+                        dims[axis] = partitionDim(tensorShape[axis], logicalHeight, tile.y - y0);
+                    }
+
+                    std::string name = ("output_" + tensorName->str() + "_from_tile" +
+                                        std::to_string(tile.hartId) + "_to_L2");
+                    result.push_back(TransitionFragment{
+                        name,
+                        *tensorId,
+                        tile.hartId,
+                        -1,
+                        dims,
+                        dims,
+                    });
+                }
+            }
+        }
     }
 
     return result;
@@ -369,6 +557,8 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
     // obtain initializer fragments from json
     auto *initializations = root->getArray("initializations");
     auto initFragments = getInitFragments(*initializations);
+    auto *transitions = root->getArray("transitions");
+    auto transitionFragments = getTransitionFragments(*transitions);
 
     // map input tensor ids to main function arguments
     llvm::DenseMap<int64_t, Value> inputTensorValues;
@@ -427,8 +617,18 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
     auto *mesh = root->getObject("mesh");
     auto *tiles = mesh->getArray("tiles");
     auto tileObjs = getTileObjs(*tiles);
+    auto stageObjs = getStageObjs(*stages);
+    SmallVector<TransitionFragment> outputFragments =
+        getOutputFragments(*stages, *tensors, *tileObjs, extOutputTensorIds);
 
     for (const Tile &tileObj : *tileObjs) {
+        bool receivesInitializer = llvm::any_of(*initFragments, [&](const Fragment &fragment) {
+            auto *tensor = (*tensors)[fragment.tensorId].getAsObject();
+            return fragment.dstHartId == tileObj.hartId &&
+                   isInitializerTensor(*tensor);
+        });
+        if (!receivesInitializer)
+            continue;
 
         auto tile = TileOp::create(
             builder,
@@ -491,55 +691,64 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
     run.getBody().emplaceBlock();
     builder.setInsertionPointToStart(&run.getBody().front());
 
-    // slice and send non initilizer data
-    for (const Fragment &fragment : *initFragments) {
-        auto *tensor = (*tensors)[fragment.tensorId].getAsObject();
-        if (isInitializerTensor(*tensor))
-            continue;
-
-        Value source = inputTensorValues.lookup(fragment.tensorId);
-
-        SmallVector<int64_t> shape;
-        SmallVector<OpFoldResult> offsets;
-        SmallVector<OpFoldResult> sizes;
-        SmallVector<OpFoldResult> strides;
-
-        for (const SliceDim &dim : fragment.srcDims) {
-            shape.push_back(dim.length);
-            offsets.push_back(builder.getIndexAttr(dim.start));
-            sizes.push_back(builder.getIndexAttr(dim.length));
-            strides.push_back(builder.getIndexAttr(1));
-        }
-
-        auto sourceType = cast<RankedTensorType>(source.getType());
-        auto sliceType = RankedTensorType::get(shape, sourceType.getElementType());
-
-        Value slice = tensor::ExtractSliceOp::create(
-            builder, loc, sliceType, source, offsets, sizes, strides);
-
-        maps::SendOp::create(
-            builder,
-            loc,
-            slice,
-            SymbolRefAttr::get(ctx, fragment.name),
-            builder.getI64IntegerAttr(fragment.srcHartId), // usually -1
-            builder.getI64IntegerAttr(fragment.dstHartId)
-        );
-    }
-
     // start of stages regions
-    auto stageObjs = getStageObjs(*stages);
-
     for (const Stage &stageObj : *stageObjs) {
 
         auto stage = StageOp::create(
-        builder,
-        loc,
-        builder.getI64IntegerAttr(stageObj.stageId),
-        builder.getStringAttr(stageObj.symName)
-    );
+            builder,
+            loc,
+            builder.getI64IntegerAttr(stageObj.stageId),
+            builder.getStringAttr(stageObj.symName)
+        );
         stage.getBody().emplaceBlock();
         builder.setInsertionPointToStart(&stage.getBody().front());
+
+        // slice and send runtime inputs consumed by this stage before tile bodies
+        for (const Fragment &fragment : *initFragments) {
+            auto *tensor = (*tensors)[fragment.tensorId].getAsObject();
+            if (isInitializerTensor(*tensor))
+                continue;
+
+            bool isFragmentInStage = false;
+            for (const Tile &tileObj : *tileObjs) {
+                if (fragment.dstHartId == tileObj.hartId &&
+                    isTileInStage(tileObj, stageObj)) {
+                    isFragmentInStage = true;
+                    break;
+                }
+            }
+            if (!isFragmentInStage)
+                continue;
+
+            Value source = inputTensorValues.lookup(fragment.tensorId);
+
+            SmallVector<int64_t> shape;
+            SmallVector<OpFoldResult> offsets;
+            SmallVector<OpFoldResult> sizes;
+            SmallVector<OpFoldResult> strides;
+
+            for (const SliceDim &dim : fragment.srcDims) {
+                shape.push_back(dim.length);
+                offsets.push_back(builder.getIndexAttr(dim.start));
+                sizes.push_back(builder.getIndexAttr(dim.length));
+                strides.push_back(builder.getIndexAttr(1));
+            }
+
+            auto sourceType = cast<RankedTensorType>(source.getType());
+            auto sliceType = RankedTensorType::get(shape, sourceType.getElementType());
+
+            Value slice = tensor::ExtractSliceOp::create(
+                builder, loc, sliceType, source, offsets, sizes, strides);
+
+            maps::SendOp::create(
+                builder,
+                loc,
+                slice,
+                SymbolRefAttr::get(ctx, fragment.name),
+                builder.getI64IntegerAttr(fragment.srcHartId),
+                builder.getI64IntegerAttr(fragment.dstHartId)
+            );
+        }
         
 
         for (const Tile &tileObj : *tileObjs) {
@@ -562,7 +771,75 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
             tile.getBody().emplaceBlock();
             builder.setInsertionPointToStart(&tile.getBody().front());
 
-            // load stored values
+            llvm::DenseMap<int64_t, Value> tileValues;
+            llvm::DenseMap<int64_t, SmallVector<std::pair<const TransitionFragment *, Value>>> transitionValues;
+
+            // receive transition fragments from producer tiles
+            for (const TransitionFragment &fragment : *transitionFragments) {
+                if (fragment.dstHartId != tileObj.hartId)
+                    continue;
+
+                auto *tensor = (*tensors)[fragment.tensorId].getAsObject();
+                SmallVector<int64_t> shape;
+                for (const SliceDim &dim : fragment.srcDims)
+                    shape.push_back(dim.length);
+
+                Type elementType = parseElementType(*tensor, builder);
+                Type resultType = RankedTensorType::get(shape, elementType);
+
+                Value transitionInput = maps::RecvOp::create(
+                    builder,
+                    loc,
+                    resultType,
+                    StringRef(fragment.name),
+                    fragment.srcHartId,
+                    fragment.dstHartId
+                ).getResult();
+                transitionValues[fragment.tensorId].push_back({&fragment, transitionInput});
+            }
+
+            for (auto &entry : transitionValues) {
+                SmallVector<std::pair<const TransitionFragment *, Value>> &values = entry.second;
+                if (values.size() == 1) {
+                    tileValues[entry.first] = values.front().second;
+                    continue;
+                }
+
+                SmallVector<TransitionFragment> fragments;
+                fragments.reserve(values.size());
+                for (const auto &value : values) {
+                    fragments.push_back(*value.first);
+                }
+
+                unsigned concatDim = getConcatDim(fragments);
+                llvm::sort(values, [concatDim](const auto &lhs, const auto &rhs) {
+                    return lhs.first->dstDims[concatDim].start < rhs.first->dstDims[concatDim].start;
+                });
+
+                SmallVector<Value> inputs;
+                inputs.reserve(values.size());
+                for (const auto &value : values)
+                    inputs.push_back(value.second);
+
+                auto firstType = cast<RankedTensorType>(inputs.front().getType());
+                SmallVector<int64_t> concatShape(firstType.getShape());
+                concatShape[concatDim] = 0;
+                for (Value input : inputs) {
+                    auto inputType = cast<RankedTensorType>(input.getType());
+                    concatShape[concatDim] += inputType.getShape()[concatDim];
+                }
+
+                auto concatType = RankedTensorType::get(concatShape, firstType.getElementType());
+                tileValues[entry.first] = tensor::ConcatOp::create(
+                    builder,
+                    loc,
+                    concatType,
+                    concatDim,
+                    inputs
+                ).getResult();
+            }
+
+            // load stored values and receive runtime inputs
             for (const Fragment &fragment : *initFragments) {
                 if (fragment.dstHartId != tileObj.hartId)
                     continue;
@@ -583,30 +860,223 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
                         resultType,
                         SymbolRefAttr::get(ctx, fragment.name)
                     ).getResult();
-            }
-            else {
-                // receive inputs
-                SmallVector<int64_t> shape;
-                for (const SliceDim &dim : fragment.srcDims)
-                    shape.push_back(dim.length);
-        
-                Type elementType = parseElementType(*tensor, builder);
-                Type resultType = RankedTensorType::get(shape, elementType);
+                    tileValues[fragment.tensorId] = localValue;
+                } else {
+                    // receive inputs
+                    SmallVector<int64_t> shape;
+                    for (const SliceDim &dim : fragment.srcDims)
+                        shape.push_back(dim.length);
+            
+                    Type elementType = parseElementType(*tensor, builder);
+                    Type resultType = RankedTensorType::get(shape, elementType);
 
-                Value runtimeInput = maps::RecvOp::create(
+                    Value runtimeInput = maps::RecvOp::create(
+                        builder,
+                        loc,
+                        resultType,
+                        StringRef(fragment.name),
+                        fragment.srcHartId,
+                        fragment.dstHartId
+                    ).getResult();
+                    tileValues[fragment.tensorId] = runtimeInput;
+                }
+            }
+            
+            // emit tile core ops
+            auto *stageJson = (*stages)[stageObj.stageId].getAsObject();
+            auto *layers = stageJson->getArray("layers");
+
+            for (const llvm::json::Value &layerValue : *layers) {
+                auto *layer = layerValue.getAsObject();
+                auto *node = layer->getObject("node");
+                auto *inputs = layer->getArray("inputs");
+                auto *outputs = layer->getArray("outputs");
+                auto nodeKind = node->getInteger("kind");
+                if (!nodeKind || !inputs || !outputs || outputs->empty())
+                    continue;
+
+                auto outputTensorId = getTensorId((*outputs)[0]);
+                if (!outputTensorId)
+                    continue;
+
+                if (*nodeKind == 0) {
+                    if (inputs->size() < 2)
+                        continue;
+
+                    auto lhsTensorId = getTensorId((*inputs)[0]);
+                    auto rhsTensorId = getTensorId((*inputs)[1]);
+                    if (!lhsTensorId || !rhsTensorId)
+                        continue;
+
+                    Value lhs = tileValues.lookup(*lhsTensorId);
+                    Value rhs = tileValues.lookup(*rhsTensorId);
+                    if (!lhs || !rhs)
+                        continue;
+
+                    auto lhsType = dyn_cast<RankedTensorType>(lhs.getType());
+                    auto rhsType = dyn_cast<RankedTensorType>(rhs.getType());
+                    if (!lhsType || !rhsType || lhsType.getRank() != 2 || rhsType.getRank() != 2)
+                        continue;
+
+                    SmallVector<int64_t> outputShape = {
+                        lhsType.getShape()[0],
+                        rhsType.getShape()[1],
+                    };
+                    Type elementType = lhsType.getElementType();
+                    auto outputType = RankedTensorType::get(outputShape, elementType);
+                    Value initTensor = tensor::EmptyOp::create(
+                        builder,
+                        loc,
+                        outputShape,
+                        elementType
+                    ).getResult();
+
+                    auto matmul = linalg::MatmulOp::create(
+                        builder,
+                        loc,
+                        TypeRange{outputType},
+                        ValueRange{lhs, rhs},
+                        ValueRange{initTensor},
+                        ArrayRef<NamedAttribute>{}
+                    );
+                    tileValues[*outputTensorId] = matmul->getResult(0);
+                    continue;
+                }
+
+                if (*nodeKind != 1 || inputs->empty())
+                    continue;
+
+                auto *payload = node->getObject("payload");
+                auto opName = payload ? payload->getString("op_name") : std::nullopt;
+                if (!opName)
+                    continue;
+
+                if (*opName == "Exp") {
+                    auto inputTensorId = getTensorId((*inputs)[0]);
+
+                    Value inputValue = tileValues.lookup(*inputTensorId);
+                    if (!inputValue)
+                        continue;
+
+                    Value exp = math::ExpOp::create(builder, loc, inputValue).getResult();
+                    tileValues[*outputTensorId] = exp;
+                    continue;
+                }
+
+                if (*opName == "Add") {
+                    if (inputs->size() < 2)
+                        continue;
+
+                    auto lhsTensorId = getTensorId((*inputs)[0]);
+                    auto rhsTensorId = getTensorId((*inputs)[1]);
+                    if (!lhsTensorId || !rhsTensorId)
+                        continue;
+
+                    Value lhs = tileValues.lookup(*lhsTensorId);
+                    Value rhs = tileValues.lookup(*rhsTensorId);
+                    if (!lhs || !rhs)
+                        continue;
+
+                    Value add = arith::AddFOp::create(builder, loc, lhs, rhs).getResult();
+                    tileValues[*outputTensorId] = add;
+                }
+            }
+
+            // send transition fragments produced by this tile
+            for (const TransitionFragment &fragment : *transitionFragments) {
+                if (fragment.srcHartId != tileObj.hartId)
+                    continue;
+
+                Value source = tileValues.lookup(fragment.tensorId);
+                if (!source)
+                    continue;
+
+                SmallVector<int64_t> shape;
+                SmallVector<OpFoldResult> offsets;
+                SmallVector<OpFoldResult> sizes;
+                SmallVector<OpFoldResult> strides;
+                SmallVector<int64_t> localStarts =
+                    getLocalStartsForSourceTile(*transitionFragments, fragment);
+
+                for (auto indexed : llvm::enumerate(fragment.srcDims)) {
+                    const SliceDim &dim = indexed.value();
+                    int64_t localOffset = dim.start - localStarts[indexed.index()];
+                    shape.push_back(dim.length);
+                    offsets.push_back(builder.getIndexAttr(localOffset));
+                    sizes.push_back(builder.getIndexAttr(dim.length));
+                    strides.push_back(builder.getIndexAttr(1));
+                }
+
+                auto sourceType = cast<RankedTensorType>(source.getType());
+                auto sliceType = RankedTensorType::get(shape, sourceType.getElementType());
+
+                Value slice = tensor::ExtractSliceOp::create(
                     builder,
                     loc,
-                    resultType,
-                    StringRef(fragment.name),
-                    fragment.srcHartId,
-                    fragment.dstHartId
-                ).getResult();
+                    sliceType,
+                    source,
+                    offsets,
+                    sizes,
+                    strides
+                );
+
+                maps::SendOp::create(
+                    builder,
+                    loc,
+                    slice,
+                    SymbolRefAttr::get(ctx, fragment.name),
+                    builder.getI64IntegerAttr(fragment.srcHartId),
+                    builder.getI64IntegerAttr(fragment.dstHartId)
+                );
             }
-            };
 
+            // send final output fragments back to L2
+            for (const TransitionFragment &fragment : outputFragments) {
+                if (fragment.srcHartId != tileObj.hartId)
+                    continue;
 
+                Value source = tileValues.lookup(fragment.tensorId);
+                if (!source)
+                    continue;
 
-           
+                SmallVector<int64_t> shape;
+                SmallVector<OpFoldResult> offsets;
+                SmallVector<OpFoldResult> sizes;
+                SmallVector<OpFoldResult> strides;
+                SmallVector<int64_t> localStarts =
+                    getLocalStartsForSourceTile(outputFragments, fragment);
+
+                for (auto indexed : llvm::enumerate(fragment.srcDims)) {
+                    const SliceDim &dim = indexed.value();
+                    int64_t localOffset = dim.start - localStarts[indexed.index()];
+                    shape.push_back(dim.length);
+                    offsets.push_back(builder.getIndexAttr(localOffset));
+                    sizes.push_back(builder.getIndexAttr(dim.length));
+                    strides.push_back(builder.getIndexAttr(1));
+                }
+
+                auto sourceType = cast<RankedTensorType>(source.getType());
+                auto sliceType = RankedTensorType::get(shape, sourceType.getElementType());
+
+                Value slice = tensor::ExtractSliceOp::create(
+                    builder,
+                    loc,
+                    sliceType,
+                    source,
+                    offsets,
+                    sizes,
+                    strides
+                );
+
+                maps::SendOp::create(
+                    builder,
+                    loc,
+                    slice,
+                    SymbolRefAttr::get(ctx, fragment.name),
+                    builder.getI64IntegerAttr(fragment.srcHartId),
+                    builder.getI64IntegerAttr(fragment.dstHartId)
+                );
+            }
 
             builder.setInsertionPointAfter(tile);
             // end of tile block
@@ -617,6 +1087,48 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
 
     builder.setInsertionPointAfter(run);
     // end of run region
+
+    // receive final output fragments from tiles and assemble them in L2
+    llvm::DenseMap<int64_t, Value> outputTensorValues = OutputTensorInitValues;
+    for (const TransitionFragment &fragment : outputFragments) {
+        auto *tensor = (*tensors)[fragment.tensorId].getAsObject();
+        SmallVector<int64_t> shape;
+        SmallVector<OpFoldResult> offsets;
+        SmallVector<OpFoldResult> sizes;
+        SmallVector<OpFoldResult> strides;
+
+        for (const SliceDim &dim : fragment.dstDims) {
+            shape.push_back(dim.length);
+            offsets.push_back(builder.getIndexAttr(dim.start));
+            sizes.push_back(builder.getIndexAttr(dim.length));
+            strides.push_back(builder.getIndexAttr(1));
+        }
+
+        Type elementType = parseElementType(*tensor, builder);
+        Type resultType = RankedTensorType::get(shape, elementType);
+
+        Value outputSlice = maps::RecvOp::create(
+            builder,
+            loc,
+            resultType,
+            StringRef(fragment.name),
+            fragment.srcHartId,
+            fragment.dstHartId
+        ).getResult();
+
+        Value currentOutput = outputTensorValues.lookup(fragment.tensorId);
+        Value updatedOutput = tensor::InsertSliceOp::create(
+            builder,
+            loc,
+            outputSlice,
+            currentOutput,
+            offsets,
+            sizes,
+            strides,
+            ArrayRef<NamedAttribute>{}
+        ).getResult();
+        outputTensorValues[fragment.tensorId] = updatedOutput;
+    }
 
     // place main's return op at the end of the block
     func::ReturnOp::create(builder, loc);
