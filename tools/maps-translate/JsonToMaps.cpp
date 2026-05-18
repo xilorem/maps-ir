@@ -421,7 +421,7 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
 
             auto *tensor = (*tensors)[fragment.tensorId].getAsObject();
             SmallVector<int64_t> shape;
-            for (const SliceDim &dim : fragment.dstDims)
+            for (const SliceDim &dim : fragment.srcDims)
                 shape.push_back(dim.length);
 
             Type elementType = parseElementType(*tensor, builder);
