@@ -466,8 +466,27 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
     );
         stage.getBody().emplaceBlock();
         builder.setInsertionPointToStart(&stage.getBody().front());
+        
 
+        for (const Tile &tileObj : *tileObjs) {
 
+            auto tile = TileOp::create(
+                builder,
+                loc,
+                builder.getStringAttr("tile" + std::to_string(tileObj.hartId)),
+                builder.getI64IntegerAttr(tileObj.hartId),
+                builder.getDenseI64ArrayAttr({tileObj.x, tileObj.y})
+            );
+
+            // start tile block
+            tile.getBody().emplaceBlock();
+            builder.setInsertionPointToStart(&tile.getBody().front());
+
+           
+
+            builder.setInsertionPointAfter(tile);
+            // end of tile block
+        }
 
         builder.setInsertionPointAfter(stage);
     }
