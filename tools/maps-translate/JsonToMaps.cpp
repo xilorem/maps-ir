@@ -53,8 +53,16 @@ struct Tile{
 struct Stage {
     int64_t stageId;
     std::string symName;
+    int64_t x0;
+    int64_t y0;
+    int64_t width;
+    int64_t height;
 };
 
+
+static bool isInitializerTensor(const llvm::json::Object &tensor) {
+    return tensor.getBoolean("is_initializer").value_or(false);
+}
 
 
 static Type parseElementType(const llvm::json::Object &tensor,
@@ -84,6 +92,14 @@ static Type parseElementType(const llvm::json::Object &tensor,
         return builder.getI64Type();
 
     return {};
+}
+
+
+static bool isTileInStage(const Tile &tile, const Stage &stage) {
+    return tile.x >= stage.x0 &&
+           tile.x < stage.x0 + stage.width &&
+           tile.y >= stage.y0 &&
+           tile.y < stage.y0 + stage.height;
 }
 
 
@@ -238,10 +254,19 @@ static std::optional<SmallVector<Stage>>getStageObjs(const llvm::json::Array &st
             return std::nullopt;
 
         std::string symName = ("stage" + std::to_string(indexed.index()));
+        auto *submesh = stage->getObject("submesh");
+        auto x0 = submesh->getInteger("x0");
+        auto y0 = submesh->getInteger("y0");
+        auto width = submesh->getInteger("width");
+        auto height = submesh->getInteger("height");
 
         result.push_back(Stage{
             static_cast<int64_t>(indexed.index()),
             symName,
+            *x0,
+            *y0,
+            *width,
+            *height,
         });
     }
 
@@ -355,6 +380,9 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
 
     // extract slices from input tensors for each fragment
     for (const Fragment &fragment : *initFragments) {
+        auto *tensor = (*tensors)[fragment.tensorId].getAsObject();
+        if (!isInitializerTensor(*tensor))
+            continue;
         Value source = inputTensorValues.lookup(fragment.tensorId);
         
         SmallVector<int64_t> shape;
@@ -420,6 +448,9 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
                 continue; // tile doesn't receive this fragment
 
             auto *tensor = (*tensors)[fragment.tensorId].getAsObject();
+            if (!isInitializerTensor(*tensor))
+                continue;
+
             SmallVector<int64_t> shape;
             for (const SliceDim &dim : fragment.srcDims)
                 shape.push_back(dim.length);
@@ -460,6 +491,41 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
     run.getBody().emplaceBlock();
     builder.setInsertionPointToStart(&run.getBody().front());
 
+    // slice and send non initilizer data
+    for (const Fragment &fragment : *initFragments) {
+        auto *tensor = (*tensors)[fragment.tensorId].getAsObject();
+        if (isInitializerTensor(*tensor))
+            continue;
+
+        Value source = inputTensorValues.lookup(fragment.tensorId);
+
+        SmallVector<int64_t> shape;
+        SmallVector<OpFoldResult> offsets;
+        SmallVector<OpFoldResult> sizes;
+        SmallVector<OpFoldResult> strides;
+
+        for (const SliceDim &dim : fragment.srcDims) {
+            shape.push_back(dim.length);
+            offsets.push_back(builder.getIndexAttr(dim.start));
+            sizes.push_back(builder.getIndexAttr(dim.length));
+            strides.push_back(builder.getIndexAttr(1));
+        }
+
+        auto sourceType = cast<RankedTensorType>(source.getType());
+        auto sliceType = RankedTensorType::get(shape, sourceType.getElementType());
+
+        Value slice = tensor::ExtractSliceOp::create(
+            builder, loc, sliceType, source, offsets, sizes, strides);
+
+        maps::SendOp::create(
+            builder,
+            loc,
+            slice,
+            SymbolRefAttr::get(ctx, fragment.name),
+            builder.getI64IntegerAttr(fragment.srcHartId), // usually -1
+            builder.getI64IntegerAttr(fragment.dstHartId)
+        );
+    }
 
     // start of stages regions
     auto stageObjs = getStageObjs(*stages);
@@ -478,6 +544,12 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
 
         for (const Tile &tileObj : *tileObjs) {
 
+            // check if tile is in the stage's submesh
+            if (!isTileInStage(tileObj, stageObj))
+                continue;
+
+
+            // if in submesh, create tile block
             auto tile = TileOp::create(
                 builder,
                 loc,
@@ -496,21 +568,43 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
                     continue;
 
                 auto *tensor = (*tensors)[fragment.tensorId].getAsObject();
+                if (isInitializerTensor(*tensor)) {
+                    // load init fragments
+                    SmallVector<int64_t> shape;
+                    for (const SliceDim &dim : fragment.srcDims)
+                        shape.push_back(dim.length);
 
+                    Type elementType = parseElementType(*tensor, builder);
+                    Type resultType = RankedTensorType::get(shape, elementType);
+
+                    Value localValue = maps::LoadOp::create(
+                        builder,
+                        loc,
+                        resultType,
+                        SymbolRefAttr::get(ctx, fragment.name)
+                    ).getResult();
+            }
+            else {
+                // receive inputs
                 SmallVector<int64_t> shape;
                 for (const SliceDim &dim : fragment.srcDims)
                     shape.push_back(dim.length);
-
+        
                 Type elementType = parseElementType(*tensor, builder);
                 Type resultType = RankedTensorType::get(shape, elementType);
 
-                Value localValue = maps::LoadOp::create(
+                Value runtimeInput = maps::RecvOp::create(
                     builder,
                     loc,
                     resultType,
-                    SymbolRefAttr::get(ctx, fragment.name)
+                    StringRef(fragment.name),
+                    fragment.srcHartId,
+                    fragment.dstHartId
                 ).getResult();
+            }
             };
+
+
 
            
 
