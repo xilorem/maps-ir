@@ -6,6 +6,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED YES)
 
 find_package(MLIR REQUIRED CONFIG)
 find_package(LLVM REQUIRED CONFIG)
+find_package(TTMLIR REQUIRED CONFIG
+  HINTS /home/ivan/repos/tt-mlir/build/lib/cmake/ttmlir
+)
 
 message(STATUS "Using MLIRConfig.cmake in: ${MLIR_DIR}")
 message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
