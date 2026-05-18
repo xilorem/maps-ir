@@ -140,4 +140,51 @@ def SendOp : Maps_Op<"send"> {
 }
 
 
+def StoreOp : Maps_Op<"store"> {
+  let summary = "Store a value for later retrival";
+
+  let description = [{
+    
+
+    ```mlir
+    
+    ```
+  }];
+
+  let arguments = (ins
+    AnyType:$value,
+    FlatSymbolRefAttr:$slot
+  );
+
+  let assemblyFormat = [{
+    $value `,` $slot attr-dict `:` type($value)
+  }];
+}
+
+
+def LoadOp : Maps_Op<"load"> {
+  let summary = "Load a value";
+
+  let description = [{
+    
+
+    ```mlir
+    
+    ```
+  }];
+
+  let arguments = (ins
+    FlatSymbolRefAttr:$slot
+  );
+
+  let results = (outs
+    AnyType:$result
+  );
+
+  let assemblyFormat = [{
+    $slot attr-dict `:` type($result)
+  }];
+}
+
+
 #endif // MAPS_OPS

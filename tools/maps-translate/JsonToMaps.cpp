@@ -428,13 +428,21 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
             Type resultType = RankedTensorType::get(shape, elementType);
 
             // create recv op for the fragment
-            maps::RecvOp::create(
+            auto recv = maps::RecvOp::create(
                 builder,
                 loc,
                 resultType,
                 StringRef(fragment.name),
                 fragment.srcHartId,
                 fragment.dstHartId
+            );
+
+            // store result
+            maps::StoreOp::create(
+                builder,
+                loc,
+                recv.getResult(),
+                SymbolRefAttr::get(ctx, fragment.name)
             );
         }
 
@@ -481,6 +489,28 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
             // start tile block
             tile.getBody().emplaceBlock();
             builder.setInsertionPointToStart(&tile.getBody().front());
+
+            // load stored values
+            for (const Fragment &fragment : *initFragments) {
+                if (fragment.dstHartId != tileObj.hartId)
+                    continue;
+
+                auto *tensor = (*tensors)[fragment.tensorId].getAsObject();
+
+                SmallVector<int64_t> shape;
+                for (const SliceDim &dim : fragment.srcDims)
+                    shape.push_back(dim.length);
+
+                Type elementType = parseElementType(*tensor, builder);
+                Type resultType = RankedTensorType::get(shape, elementType);
+
+                Value localValue = maps::LoadOp::create(
+                    builder,
+                    loc,
+                    resultType,
+                    SymbolRefAttr::get(ctx, fragment.name)
+                ).getResult();
+            };
 
            
 
