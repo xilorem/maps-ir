@@ -36,7 +36,8 @@ struct SliceDim {
 };
 
 struct Fragment {
-    std::string name;
+    std::string name;      // channel name
+    std::string slotName;  // local tile storage name
     int64_t tensorId;
     int64_t srcHartId;
     int64_t dstHartId;
@@ -279,13 +280,20 @@ static std::optional<SmallVector<Fragment>> getInitFragments(const llvm::json::A
             auto dstHartId = fragment->getInteger("dst_hartid");
             auto *srcSlice = fragment->getObject("src_slice");
             auto *dstSlice = fragment->getObject("dst_slice");
-            auto fragName = (name->str() + "_from_L2_to_tile" + std::to_string(*dstHartId));
+            
+            auto channelName = name->str() + "_from_L2_to_tile" + std::to_string(*dstHartId);
 
+            std::string slotBase = name->str();
+            if (llvm::StringRef(slotBase).starts_with("init_"))
+                slotBase = slotBase.substr(5);
+
+            auto slotName = slotBase + "_tile" + std::to_string(*dstHartId);
             auto srcDims = parseSliceDims(*srcSlice);
             auto dstDims = parseSliceDims(*dstSlice);
 
             result.push_back(Fragment{
-                fragName,
+                channelName,
+                slotName,
                 *tensorId,
                 *srcHartId,
                 *dstHartId,
@@ -673,7 +681,7 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
                 builder,
                 loc,
                 recv.getResult(),
-                SymbolRefAttr::get(ctx, fragment.name)
+                SymbolRefAttr::get(ctx, fragment.slotName)
             );
         }
 
@@ -858,7 +866,7 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
                         builder,
                         loc,
                         resultType,
-                        SymbolRefAttr::get(ctx, fragment.name)
+                        SymbolRefAttr::get(ctx, fragment.slotName)
                     ).getResult();
                     tileValues[fragment.tensorId] = localValue;
                 } else {
