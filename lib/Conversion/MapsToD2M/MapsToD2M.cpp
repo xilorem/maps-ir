@@ -67,6 +67,7 @@ static FailureOr<MapsProgramInfo> collectMapsProgram(ModuleOp module){
     stage.walk([&](maps::TileOp tile){
       TileInfo tileInfo;
       tileInfo.op = tile;
+      tileInfo.tileId = static_cast<int64_t>(tile.getTileId());
       tileInfo.coords = static_cast<SmallVector<int64_t>>(tile.getCoords());
       stageInfo.tiles.push_back(tileInfo);
     });
