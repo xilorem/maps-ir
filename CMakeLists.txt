@@ -4,10 +4,14 @@ project(maps-ir LANGUAGES CXX C)
 set (CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED YES)
 
-find_package(MLIR REQUIRED CONFIG)
-find_package(LLVM REQUIRED CONFIG)
+find_package(MLIR REQUIRED CONFIG
+  HINTS /opt/ttmlir-toolchain/lib/cmake/mlir
+)
+find_package(LLVM REQUIRED CONFIG
+  HINTS /opt/ttmlir-toolchain/lib/cmake/llvm
+)
 find_package(TTMLIR REQUIRED CONFIG
-  HINTS /home/ivan/repos/tt-mlir/build/lib/cmake/ttmlir
+  HINTS /home/ivan/repos/tt-mlir/install/lib/cmake/ttmlir
 )
 
 message(STATUS "Using MLIRConfig.cmake in: ${MLIR_DIR}")

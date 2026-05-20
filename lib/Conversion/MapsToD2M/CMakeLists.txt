@@ -6,6 +6,11 @@ add_mlir_library(MLIRMapsToD2M
 
   LINK_LIBS PUBLIC
   MLIRMapsDialect
+  TTMLIR::MLIRTTCoreDialect
+  TTMLIR::MLIRD2MDialect
+  TTMLIR::MLIRD2MUtils
+  TTMLIR::MLIRTTIRDialect
+  TTMLIR::MLIRTTNNDialect
   MLIRIR
   MLIRPass
 )

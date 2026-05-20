@@ -107,34 +107,20 @@ namespace {
 struct InitOpLowering : public OpConversionPattern<maps::InitOp> {
   using OpConversionPattern<maps::InitOp>::OpConversionPattern;
 
-  LogicalResult
-  matchAndRewrite(maps::InitOp op, OpAdaptor adaptor,
+  LogicalResult matchAndRewrite(maps::InitOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Block &body = op.getBody().front();
 
-    rewriter.setInsertionPoint(op);
-
-    SmallVector<Operation *> opsToMove;
-    for (Operation &nested : llvm::make_early_inc_range(body)) {
-      if (isa<maps::SendOp, maps::RecvOp, maps::TileOp>(nested))
-        continue;
-
-      opsToMove.push_back(&nested);
-    }
-
-    for (Operation *nested : opsToMove)
-      nested->moveBefore(op);
-
+    rewriter.inlineBlockBefore(&body, op);
     rewriter.eraseOp(op);
     return success();
   }
-};
+  };
 } // namespace
 
 
 namespace {
-struct ConvertMapsToD2MPass
-    : impl::ConvertMapsToD2MBase<ConvertMapsToD2MPass> {
+struct ConvertMapsToD2MPass: impl::ConvertMapsToD2MBase<ConvertMapsToD2MPass> {
   void runOnOperation() override {
 
     MLIRContext *ctx = &getContext();
@@ -144,7 +130,7 @@ struct ConvertMapsToD2MPass
     if (failed(info)) {
       signalPassFailure();
     return;
-  }
+   }
     
     ConversionTarget target(*ctx);
     target.addLegalOp<ModuleOp>();
@@ -161,13 +147,18 @@ struct ConvertMapsToD2MPass
     // Source dialect
     target.addIllegalDialect<mlir::maps::MapsDialect>();
 
+    target.addLegalOp<maps::SendOp, maps::RecvOp, maps::TileOp,
+                    maps::StoreOp, maps::LoadOp>(); // temporary
+
 
     // mark as legal ops that aren't mentioned
     target.markUnknownOpDynamicallyLegal([](Operation *){
       return true;
     });
 
+    // register patterns
     RewritePatternSet patterns(ctx);
+    patterns.add<InitOpLowering>(ctx);
 
     if (failed(applyPartialConversion(module, target, std::move(patterns)))){
       signalPassFailure();
