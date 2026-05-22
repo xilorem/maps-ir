@@ -1,4 +1,10 @@
 add_mlir_library(MLIRMapsToD2M
+  D2MGenericBuilder.cpp
+  D2MTypeUtils.cpp
+  MapsABIRewriter.cpp
+  MapsCleanup.cpp
+  MapsPatternLowering.cpp
+  MapsProgramAnalysis.cpp
   MapsToD2M.cpp
 
   DEPENDS
