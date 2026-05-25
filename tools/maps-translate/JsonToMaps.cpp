@@ -848,31 +848,43 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
                 auto *inputs = layer->getArray("inputs");
                 auto *outputs = layer->getArray("outputs");
                 auto nodeKind = node->getInteger("kind");
-                if (!nodeKind || !inputs || !outputs || outputs->empty())
-                    continue;
+                if (!nodeKind || !inputs || !outputs || outputs->empty()) {
+                    llvm::errs() << "unsupported MAPS layer: missing node inputs or outputs\n";
+                    return {};
+                }
 
                 auto outputTensorId = getTensorId((*outputs)[0]);
-                if (!outputTensorId)
-                    continue;
+                if (!outputTensorId) {
+                    llvm::errs() << "unsupported MAPS layer: output has no tensor id\n";
+                    return {};
+                }
 
                 if (*nodeKind == 0) {
-                    if (inputs->size() < 2)
-                        continue;
+                    if (inputs->size() < 2) {
+                        llvm::errs() << "unsupported Matmul node: expected two inputs\n";
+                        return {};
+                    }
 
                     auto lhsTensorId = getTensorId((*inputs)[0]);
                     auto rhsTensorId = getTensorId((*inputs)[1]);
-                    if (!lhsTensorId || !rhsTensorId)
-                        continue;
+                    if (!lhsTensorId || !rhsTensorId) {
+                        llvm::errs() << "unsupported Matmul node: missing tensor id\n";
+                        return {};
+                    }
 
                     Value lhs = tileValues.lookup(*lhsTensorId);
                     Value rhs = tileValues.lookup(*rhsTensorId);
-                    if (!lhs || !rhs)
-                        continue;
+                    if (!lhs || !rhs) {
+                        llvm::errs() << "unsupported Matmul node: missing local input value\n";
+                        return {};
+                    }
 
                     auto lhsType = dyn_cast<RankedTensorType>(lhs.getType());
                     auto rhsType = dyn_cast<RankedTensorType>(rhs.getType());
-                    if (!lhsType || !rhsType || lhsType.getRank() != 2 || rhsType.getRank() != 2)
-                        continue;
+                    if (!lhsType || !rhsType || lhsType.getRank() != 2 || rhsType.getRank() != 2) {
+                        llvm::errs() << "unsupported Matmul node: expected rank-2 tensor inputs\n";
+                        return {};
+                    }
 
                     SmallVector<int64_t> outputShape = {
                         lhsType.getShape()[0],
@@ -899,20 +911,36 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
                     continue;
                 }
 
-                if (*nodeKind != 1 || inputs->empty())
-                    continue;
+                if (*nodeKind == 3) {
+                    llvm::errs() << "unsupported MAPS operation Conv: export an explicit "
+                                    "im2col/matmul decomposition before translation\n";
+                    return {};
+                }
+
+                if (*nodeKind != 1 || inputs->empty()) {
+                    llvm::errs() << "unsupported MAPS node kind " << *nodeKind << "\n";
+                    return {};
+                }
 
                 auto *payload = node->getObject("payload");
                 auto opName = payload ? payload->getString("op_name") : std::nullopt;
-                if (!opName)
-                    continue;
+                if (!opName) {
+                    llvm::errs() << "unsupported elementwise MAPS node: missing op_name\n";
+                    return {};
+                }
 
                 if (*opName == "Exp") {
                     auto inputTensorId = getTensorId((*inputs)[0]);
+                    if (!inputTensorId) {
+                        llvm::errs() << "unsupported Exp node: missing tensor id\n";
+                        return {};
+                    }
 
                     Value inputValue = tileValues.lookup(*inputTensorId);
-                    if (!inputValue)
-                        continue;
+                    if (!inputValue) {
+                        llvm::errs() << "unsupported Exp node: missing local input value\n";
+                        return {};
+                    }
 
                     Value exp = math::ExpOp::create(builder, loc, inputValue).getResult();
                     tileValues[*outputTensorId] = exp;
@@ -925,17 +953,25 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
 
                     auto lhsTensorId = getTensorId((*inputs)[0]);
                     auto rhsTensorId = getTensorId((*inputs)[1]);
-                    if (!lhsTensorId || !rhsTensorId)
-                        continue;
+                    if (!lhsTensorId || !rhsTensorId) {
+                        llvm::errs() << "unsupported Add node: missing tensor id\n";
+                        return {};
+                    }
 
                     Value lhs = tileValues.lookup(*lhsTensorId);
                     Value rhs = tileValues.lookup(*rhsTensorId);
-                    if (!lhs || !rhs)
-                        continue;
+                    if (!lhs || !rhs) {
+                        llvm::errs() << "unsupported Add node: missing local input value\n";
+                        return {};
+                    }
 
                     Value add = arith::AddFOp::create(builder, loc, lhs, rhs).getResult();
                     tileValues[*outputTensorId] = add;
+                    continue;
                 }
+
+                llvm::errs() << "unsupported elementwise MAPS op " << *opName << "\n";
+                return {};
             }
 
             // send transition fragments produced by this tile

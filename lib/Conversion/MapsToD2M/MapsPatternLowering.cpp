@@ -11,6 +11,8 @@
 #include "ttmlir/Dialect/D2M/IR/D2M.h"
 #include "ttmlir/Dialect/TTCore/IR/TTCore.h"
 
+#include <functional>
+
 namespace mlir::maps {
 namespace {
 
@@ -131,6 +133,76 @@ static FailureOr<bool> lowerComputeTile(
   };
 
   D2MGenericBuilder builder(rewriter.getContext(), rewriter);
+  using OptionalValue = std::optional<Value>;
+  std::function<FailureOr<OptionalValue>(
+      Value, RankedTensorType, tensor::ExtractSliceOp)> lowerValue;
+
+  lowerValue = [&](Value value, RankedTensorType outputType,
+                   tensor::ExtractSliceOp outputSlice)
+      -> FailureOr<OptionalValue> {
+    if (auto exp = value.getDefiningOp<math::ExpOp>()) {
+      auto loweredInput = lowerValue(exp.getOperand(), outputType, outputSlice);
+      if (failed(loweredInput) || !*loweredInput)
+        return loweredInput;
+
+      auto expGeneric =
+          builder.createExpGeneric(exp.getLoc(), **loweredInput, outputType);
+      if (failed(expGeneric))
+        return failure();
+      return OptionalValue(expGeneric->getResult(0));
+    }
+
+    if (auto matmul = value.getDefiningOp<linalg::MatmulOp>()) {
+      auto lhsSource = getSourceValue(matmul.getInputs()[0]);
+      auto rhsSource = getSourceValue(matmul.getInputs()[1]);
+      if (failed(lhsSource) || failed(rhsSource))
+        return OptionalValue();
+
+      Value rhsValue = *rhsSource;
+      if (outputSlice) {
+        auto rhsType = cast<RankedTensorType>(rhsValue.getType());
+        SmallVector<int64_t> offsets(rhsType.getRank(), 0);
+        SmallVector<int64_t> sizes(rhsType.getShape().begin(),
+                                   rhsType.getShape().end());
+        offsets.back() = outputSlice.getStaticOffsets().back();
+        sizes.back() = outputSlice.getStaticSizes().back();
+        rhsValue = createDirectStaticSlice(rewriter, value.getLoc(), rhsValue,
+                                           offsets, sizes);
+        rhsValue = materializeContiguousTensor(rewriter, value.getLoc(), rhsValue);
+      }
+
+          auto tiledLhs = builder.getTiledValue(*lhsSource);
+          auto tiledRhs = builder.getTiledValue(rhsValue);
+          if (failed(tiledLhs) || failed(tiledRhs))
+            return tile.emitOpError("failed to materialize tiled matmul inputs");
+          auto matmulGeneric = builder.createMatmulGeneric(
+              value.getLoc(), *tiledLhs, *tiledRhs, outputType);
+          if (failed(matmulGeneric))
+            return failure();
+          return OptionalValue(matmulGeneric->getResult(0));
+        }
+
+        Operation *definingOp = value.getDefiningOp();
+        if (definingOp && !isa<maps::RecvOp, maps::LoadOp>(definingOp))
+          return definingOp->emitOpError(
+              "unsupported nested compute producer in MAPS-to-D2M lowering");
+
+        auto sourceValue = getSourceValue(value);
+        if (failed(sourceValue))
+          return OptionalValue();
+
+    Value input = *sourceValue;
+    if (outputSlice) {
+      input = createDirectStaticSlice(
+          rewriter, value.getLoc(), input, outputSlice.getStaticOffsets(),
+          outputSlice.getStaticSizes());
+      input = materializeContiguousTensor(rewriter, value.getLoc(), input);
+        }
+        auto tiledInput = builder.getTiledValue(input);
+        if (failed(tiledInput))
+          return tile.emitOpError("failed to materialize tiled compute input");
+        return OptionalValue(*tiledInput);
+      };
 
   for (maps::SendOp send : sends) {
     auto outputType = cast<RankedTensorType>(send.getValue().getType());
@@ -139,49 +211,16 @@ static FailureOr<bool> lowerComputeTile(
     if (sendSlice)
       sendValue = sendSlice.getSource();
 
-    if (auto exp = sendValue.getDefiningOp<math::ExpOp>()) {
-      auto matmul = exp.getOperand().getDefiningOp<linalg::MatmulOp>();
-      if (!matmul)
-        return send.emitOpError("expected exp(matmul(...)) producer");
-
-      auto lhsSource = getSourceValue(matmul.getInputs()[0]);
-      auto rhsSource = getSourceValue(matmul.getInputs()[1]);
-      if (failed(lhsSource) || failed(rhsSource))
-        return success(false);
-
-      Value rhsValue = *rhsSource;
-      if (sendSlice) {
-        auto rhsType = cast<RankedTensorType>(rhsValue.getType());
-        SmallVector<int64_t> offsets(rhsType.getRank(), 0);
-        SmallVector<int64_t> sizes(rhsType.getShape().begin(),
-                                   rhsType.getShape().end());
-        offsets.back() = sendSlice.getStaticOffsets().back();
-        sizes.back() = sendSlice.getStaticSizes().back();
-        rewriter.setInsertionPoint(tile);
-        rhsValue = createDirectStaticSlice(rewriter, send.getLoc(), rhsValue,
-                                           offsets, sizes);
-        rhsValue =
-            materializeContiguousTensor(rewriter, send.getLoc(), rhsValue);
-      }
-
+    if (isa_and_nonnull<math::ExpOp, linalg::MatmulOp>(
+            sendValue.getDefiningOp())) {
       rewriter.setInsertionPoint(tile);
-      auto tiledLhs = builder.getTiledValue(*lhsSource);
-      auto tiledRhs = builder.getTiledValue(rhsValue);
-      if (failed(tiledLhs) || failed(tiledRhs))
-        return send.emitOpError("failed to materialize tiled matmul inputs");
-
-      auto matmulGeneric = builder.createMatmulGeneric(send.getLoc(), *tiledLhs,
-                                                       *tiledRhs, outputType);
-      if (failed(matmulGeneric))
+      auto loweredValue = lowerValue(sendValue, outputType, sendSlice);
+      if (failed(loweredValue))
         return failure();
-      auto expGeneric = builder.createExpGeneric(send.getLoc(),
-                                                 matmulGeneric->getResult(0),
-                                                 outputType);
-      if (failed(expGeneric))
-        return failure();
-
-      channelValues[send.getChannelAttr()] = expGeneric->getResult(0);
-      channelValueLists[send.getChannelAttr()] = {expGeneric->getResult(0)};
+      if (!*loweredValue)
+        return success(false);
+      channelValues[send.getChannelAttr()] = **loweredValue;
+      channelValueLists[send.getChannelAttr()] = {**loweredValue};
     } else if (auto add = sendValue.getDefiningOp<arith::AddFOp>()) {
       auto concat = add.getLhs().getDefiningOp<tensor::ConcatOp>();
       Value bias = add.getRhs();
