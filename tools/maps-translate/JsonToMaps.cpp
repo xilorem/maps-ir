@@ -159,24 +159,6 @@ static unsigned getConcatDim(ArrayRef<TransitionFragment> fragments) {
 }
 
 
-static SmallVector<int64_t> getTensorShape(const llvm::json::Object &tensor) {
-    SmallVector<int64_t> shape;
-    auto *dims = tensor.getArray("dims");
-    for (const llvm::json::Value &dimValue : *dims)
-        shape.push_back(*dimValue.getAsInteger());
-    return shape;
-}
-
-
-static SliceDim partitionDim(int64_t size, int64_t parts, int64_t index) {
-    int64_t base = size / parts;
-    int64_t remainder = size % parts;
-    int64_t length = base + (index < remainder ? 1 : 0);
-    int64_t start = index * base + std::min(index, remainder);
-    return {start, length};
-}
-
-
 static RankedTensorType parseTensorType(const llvm::json::Object &tensor,
                                         OpBuilder &builder) {
 
@@ -346,6 +328,47 @@ static std::optional<SmallVector<TransitionFragment>> getTransitionFragments(con
     return result;
 }
 
+static std::optional<SmallVector<TransitionFragment>> getFinalizationFragments(
+    const llvm::json::Array &finalizations) {
+    SmallVector<TransitionFragment> result;
+
+    for (const llvm::json::Value &finalizationValue : finalizations) {
+        auto *finalization = finalizationValue.getAsObject();
+        if (!finalization)
+            return std::nullopt;
+
+        auto tensorId = finalization->getInteger("tensor_id");
+        auto *fragments = finalization->getArray("fragments");
+        auto name = finalization->getString("name");
+
+        for (const llvm::json::Value &fragmentValue : *fragments) {
+            auto *fragment = fragmentValue.getAsObject();
+            if (!fragment)
+                return std::nullopt;
+
+            auto srcHartId = fragment->getInteger("src_hartid");
+            auto dstHartId = fragment->getInteger("dst_hartid");
+            auto *srcSlice = fragment->getObject("src_slice");
+            auto *dstSlice = fragment->getObject("dst_slice");
+            auto fragName = (name->str() + "_from_tile" + std::to_string(*srcHartId) +
+                             "_to_L2");
+
+            auto srcDims = parseSliceDims(*srcSlice);
+            auto dstDims = parseSliceDims(*dstSlice);
+
+            result.push_back(TransitionFragment{
+                fragName,
+                *tensorId,
+                *srcHartId,
+                *dstHartId,
+                *srcDims,
+                *dstDims,
+            });
+        }
+    }
+    return result;
+}
+
 
 static std::optional<SmallVector<Tile>> getTileObjs(const llvm::json::Array &tiles) {
     SmallVector<Tile> result;
@@ -390,80 +413,6 @@ static std::optional<SmallVector<Stage>>getStageObjs(const llvm::json::Array &st
             *width,
             *height,
         });
-    }
-
-    return result;
-}
-
-
-static SmallVector<TransitionFragment> getOutputFragments(const llvm::json::Array &stages,
-                                                          const llvm::json::Array &tensors,
-                                                          const SmallVector<Tile> &tiles,
-                                                          const llvm::SetVector<int64_t> &outputTensorIds) {
-    SmallVector<TransitionFragment> result;
-
-    for (const llvm::json::Value &stageValue : stages) {
-        auto *stage = stageValue.getAsObject();
-        auto *layers = stage->getArray("layers");
-
-        for (const llvm::json::Value &layerValue : *layers) {
-            auto *layer = layerValue.getAsObject();
-            auto *outputs = layer->getArray("outputs");
-
-            for (const llvm::json::Value &outputValue : *outputs) {
-                auto *output = outputValue.getAsObject();
-                auto tensorId = output->getInteger("tensor_id");
-                if (!tensorId || !outputTensorIds.contains(*tensorId))
-                    continue;
-
-                auto *tensor = tensors[*tensorId].getAsObject();
-                SmallVector<int64_t> tensorShape = getTensorShape(*tensor);
-                auto tensorName = tensor->getString("name");
-
-                auto *layout = output->getObject("layout");
-                auto *submesh = layout->getObject("submesh");
-                int64_t x0 = *submesh->getInteger("x0");
-                int64_t y0 = *submesh->getInteger("y0");
-                int64_t width = *submesh->getInteger("width");
-                int64_t height = *submesh->getInteger("height");
-
-                auto *meshX = layout->getObject("mesh_x");
-                auto *meshY = layout->getObject("mesh_y");
-                int64_t logicalWidth = *layout->getInteger("logical_width");
-                int64_t logicalHeight = *layout->getInteger("logical_height");
-
-                for (const Tile &tile : tiles) {
-                    if (tile.x < x0 || tile.x >= x0 + width ||
-                        tile.y < y0 || tile.y >= y0 + height)
-                        continue;
-
-                    SmallVector<SliceDim> dims;
-                    dims.reserve(tensorShape.size());
-                    for (int64_t dim : tensorShape)
-                        dims.push_back({0, dim});
-
-                    if (*meshX->getInteger("mode") == 1) {
-                        int64_t axis = *meshX->getInteger("tensor_axis");
-                        dims[axis] = partitionDim(tensorShape[axis], logicalWidth, tile.x - x0);
-                    }
-                    if (*meshY->getInteger("mode") == 1) {
-                        int64_t axis = *meshY->getInteger("tensor_axis");
-                        dims[axis] = partitionDim(tensorShape[axis], logicalHeight, tile.y - y0);
-                    }
-
-                    std::string name = ("output_" + tensorName->str() + "_from_tile" +
-                                        std::to_string(tile.hartId) + "_to_L2");
-                    result.push_back(TransitionFragment{
-                        name,
-                        *tensorId,
-                        tile.hartId,
-                        -1,
-                        dims,
-                        dims,
-                    });
-                }
-            }
-        }
     }
 
     return result;
@@ -567,6 +516,8 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
     auto initFragments = getInitFragments(*initializations);
     auto *transitions = root->getArray("transitions");
     auto transitionFragments = getTransitionFragments(*transitions);
+    auto *finalizations = root->getArray("finalizations");
+    auto outputFragments = getFinalizationFragments(*finalizations);
 
     // map input tensor ids to main function arguments
     llvm::DenseMap<int64_t, Value> inputTensorValues;
@@ -626,9 +577,6 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
     auto *tiles = mesh->getArray("tiles");
     auto tileObjs = getTileObjs(*tiles);
     auto stageObjs = getStageObjs(*stages);
-    SmallVector<TransitionFragment> outputFragments =
-        getOutputFragments(*stages, *tensors, *tileObjs, extOutputTensorIds);
-
     for (const Tile &tileObj : *tileObjs) {
         bool receivesInitializer = llvm::any_of(*initFragments, [&](const Fragment &fragment) {
             auto *tensor = (*tensors)[fragment.tensorId].getAsObject();
@@ -1039,7 +987,7 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
             }
 
             // send final output fragments back to L2
-            for (const TransitionFragment &fragment : outputFragments) {
+            for (const TransitionFragment &fragment : *outputFragments) {
                 if (fragment.srcHartId != tileObj.hartId)
                     continue;
 
@@ -1052,7 +1000,7 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
                 SmallVector<OpFoldResult> sizes;
                 SmallVector<OpFoldResult> strides;
                 SmallVector<int64_t> localStarts =
-                    getLocalStartsForSourceTile(outputFragments, fragment);
+                    getLocalStartsForSourceTile(*outputFragments, fragment);
 
                 for (auto indexed : llvm::enumerate(fragment.srcDims)) {
                     const SliceDim &dim = indexed.value();
@@ -1098,7 +1046,7 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
 
     // receive final output fragments from tiles and assemble them in L2
     llvm::DenseMap<int64_t, Value> outputTensorValues = OutputTensorInitValues;
-    for (const TransitionFragment &fragment : outputFragments) {
+    for (const TransitionFragment &fragment : *outputFragments) {
         auto *tensor = (*tensors)[fragment.tensorId].getAsObject();
         SmallVector<int64_t> shape;
         SmallVector<OpFoldResult> offsets;
