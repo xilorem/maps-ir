@@ -104,6 +104,51 @@ static Type parseElementType(const llvm::json::Object &tensor,
     return {};
 }
 
+static Attribute parseJsonAttribute(const llvm::json::Value &value,
+                                    OpBuilder &builder) {
+    if (auto string = value.getAsString())
+        return builder.getStringAttr(*string);
+    if (auto integer = value.getAsInteger())
+        return builder.getI64IntegerAttr(*integer);
+    if (auto number = value.getAsNumber())
+        return builder.getF64FloatAttr(*number);
+    if (auto boolean = value.getAsBoolean())
+        return builder.getBoolAttr(*boolean);
+    if (auto *array = value.getAsArray()) {
+        SmallVector<Attribute> elements;
+        for (const llvm::json::Value &element : *array) {
+            Attribute attr = parseJsonAttribute(element, builder);
+            if (!attr)
+                return {};
+            elements.push_back(attr);
+        }
+        return builder.getArrayAttr(elements);
+    }
+    if (auto *object = value.getAsObject()) {
+        SmallVector<NamedAttribute> attributes;
+        for (const auto &entry : *object) {
+            Attribute attr = parseJsonAttribute(entry.second, builder);
+            if (!attr)
+                return {};
+            attributes.push_back(builder.getNamedAttr(entry.first, attr));
+        }
+        return builder.getDictionaryAttr(attributes);
+    }
+    return {};
+}
+
+static DictionaryAttr parseJsonObject(const llvm::json::Object &object,
+                                      OpBuilder &builder) {
+    SmallVector<NamedAttribute> attributes;
+    for (const auto &entry : object) {
+        Attribute attr = parseJsonAttribute(entry.second, builder);
+        if (!attr)
+            return {};
+        attributes.push_back(builder.getNamedAttr(entry.first, attr));
+    }
+    return builder.getDictionaryAttr(attributes);
+}
+
 
 static bool isTileInStage(const Tile &tile, const Stage &stage) {
     return tile.x >= stage.x0 &&
@@ -118,6 +163,13 @@ static std::optional<int64_t> getTensorId(const llvm::json::Value &value) {
     if (!object)
         return std::nullopt;
     return object->getInteger("tensor_id");
+}
+
+static SliceDim partitionDim(int64_t size, int64_t parts, int64_t index) {
+    int64_t base = size / parts;
+    int64_t remainder = size % parts;
+    return {index * base + std::min(index, remainder),
+            base + (index < remainder ? 1 : 0)};
 }
 
 
@@ -181,6 +233,61 @@ static RankedTensorType parseTensorType(const llvm::json::Object &tensor,
     if (!elementType)
         return {};
 
+    return RankedTensorType::get(dims, elementType);
+}
+
+static std::optional<RankedTensorType>
+parseTileOutputType(const llvm::json::Object &tensor,
+                    const llvm::json::Object &output, const Tile &tile,
+                    Type elementType) {
+    auto *dimsJson = tensor.getArray("dims");
+    auto *layout = output.getObject("layout");
+    auto *submesh = layout ? layout->getObject("submesh") : nullptr;
+    auto *meshX = layout ? layout->getObject("mesh_x") : nullptr;
+    auto *meshY = layout ? layout->getObject("mesh_y") : nullptr;
+    if (!dimsJson || !layout || !submesh || !meshX || !meshY)
+        return std::nullopt;
+
+    auto x0 = submesh->getInteger("x0");
+    auto y0 = submesh->getInteger("y0");
+    auto width = submesh->getInteger("width");
+    auto logicalWidth = layout->getInteger("logical_width");
+    auto logicalHeight = layout->getInteger("logical_height");
+    if (!x0 || !y0 || !width || !logicalWidth || !logicalHeight ||
+        *logicalWidth <= 0 || *logicalHeight <= 0)
+        return std::nullopt;
+
+    int64_t ordinal = (tile.y - *y0) * *width + tile.x - *x0;
+    int64_t logicalX = ordinal % *logicalWidth;
+    int64_t logicalY = ordinal / *logicalWidth;
+    if (ordinal < 0 || logicalY >= *logicalHeight)
+        return std::nullopt;
+
+    SmallVector<int64_t> dims;
+    for (const llvm::json::Value &dimValue : *dimsJson) {
+        auto dim = dimValue.getAsInteger();
+        if (!dim)
+            return std::nullopt;
+        dims.push_back(*dim);
+    }
+
+    auto shardDimension = [&](const llvm::json::Object &mapping, int64_t parts,
+                              int64_t index) -> bool {
+        auto mode = mapping.getInteger("mode");
+        if (!mode)
+            return false;
+        if (*mode != 1)
+            return true;
+        auto axis = mapping.getInteger("tensor_axis");
+        if (!axis || *axis < 0 || static_cast<size_t>(*axis) >= dims.size())
+            return false;
+        dims[*axis] = partitionDim(dims[*axis], parts, index).length;
+        return true;
+    };
+
+    if (!shardDimension(*meshX, *logicalWidth, logicalX) ||
+        !shardDimension(*meshY, *logicalHeight, logicalY))
+        return std::nullopt;
     return RankedTensorType::get(dims, elementType);
 }
 
@@ -767,6 +874,56 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
                     fragments.push_back(*value.first);
                 }
 
+                SmallVector<unsigned> varyingDims;
+                for (auto indexed : llvm::enumerate(fragments.front().dstDims)) {
+                    int64_t start = indexed.value().start;
+                    if (llvm::any_of(fragments, [&](const TransitionFragment &fragment) {
+                            return fragment.dstDims[indexed.index()].start != start;
+                        }))
+                        varyingDims.push_back(indexed.index());
+                }
+
+                if (varyingDims.size() > 1) {
+                    SmallVector<int64_t> starts;
+                    SmallVector<int64_t> ends;
+                    for (const SliceDim &dim : fragments.front().dstDims) {
+                        starts.push_back(dim.start);
+                        ends.push_back(dim.start + dim.length);
+                    }
+                    for (const TransitionFragment &fragment : fragments) {
+                        for (auto indexed : llvm::enumerate(fragment.dstDims)) {
+                            starts[indexed.index()] =
+                                std::min(starts[indexed.index()], indexed.value().start);
+                            ends[indexed.index()] =
+                                std::max(ends[indexed.index()],
+                                         indexed.value().start + indexed.value().length);
+                        }
+                    }
+
+                    auto firstType = cast<RankedTensorType>(values.front().second.getType());
+                    SmallVector<int64_t> assembledShape;
+                    for (auto indexed : llvm::enumerate(starts))
+                        assembledShape.push_back(ends[indexed.index()] - indexed.value());
+                    Value assembled = tensor::EmptyOp::create(
+                        builder, loc, assembledShape, firstType.getElementType()).getResult();
+
+                    for (const auto &value : values) {
+                        SmallVector<OpFoldResult> offsets;
+                        SmallVector<OpFoldResult> sizes;
+                        SmallVector<OpFoldResult> strides;
+                        for (auto indexed : llvm::enumerate(value.first->dstDims)) {
+                            offsets.push_back(builder.getIndexAttr(
+                                indexed.value().start - starts[indexed.index()]));
+                            sizes.push_back(builder.getIndexAttr(indexed.value().length));
+                            strides.push_back(builder.getIndexAttr(1));
+                        }
+                        assembled = tensor::InsertSliceOp::create(
+                            builder, loc, value.second, assembled, offsets, sizes, strides);
+                    }
+                    tileValues[entry.first] = assembled;
+                    continue;
+                }
+
                 unsigned concatDim = getConcatDim(fragments);
                 llvm::sort(values, [concatDim](const auto &lhs, const auto &rhs) {
                     return lhs.first->dstDims[concatDim].start < rhs.first->dstDims[concatDim].start;
@@ -911,6 +1068,68 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
                     continue;
                 }
 
+                if (*nodeKind == 4) {
+                    auto *payload = node->getObject("payload");
+                    auto opName = payload ? payload->getString("op_name") : std::nullopt;
+                    auto *nodeOutputs = node->getArray("outputs");
+                    auto *nodeOutput = nodeOutputs && !nodeOutputs->empty()
+                                           ? (*nodeOutputs)[0].getAsObject()
+                                           : nullptr;
+                    auto *output = (*outputs)[0].getAsObject();
+                    if (!opName || !nodeOutput || !output || inputs->empty()) {
+                        llvm::errs() << "unsupported transform MAPS node: missing metadata\n";
+                        return {};
+                    }
+
+                    SmallVector<Value> inputValues;
+                    for (const llvm::json::Value &input : *inputs) {
+                        auto tensorId = getTensorId(input);
+                        Value inputValue =
+                            tensorId ? tileValues.lookup(*tensorId) : Value{};
+                        if (!inputValue) {
+                            llvm::errs() << "unsupported transform MAPS node: missing local "
+                                            "input value\n";
+                            return {};
+                        }
+                        inputValues.push_back(inputValue);
+                    }
+
+                    Type elementType =
+                        cast<RankedTensorType>(inputValues.front().getType())
+                            .getElementType();
+                    auto outputType =
+                        parseTileOutputType(*nodeOutput, *output, tileObj, elementType);
+                    if (!outputType) {
+                        llvm::errs() << "unsupported transform MAPS node: invalid output "
+                                        "layout\n";
+                        return {};
+                    }
+
+                    OperationState state(loc, maps::TransformOp::getOperationName());
+                    state.addOperands(inputValues);
+                    state.addTypes(*outputType);
+                    state.addAttribute("op_name", builder.getStringAttr(*opName));
+                    DictionaryAttr payloadAttr = parseJsonObject(*payload, builder);
+                    if (!payloadAttr) {
+                        llvm::errs() << "unsupported transform MAPS node: invalid payload\n";
+                        return {};
+                    }
+                    state.addAttribute("payload", payloadAttr);
+                    if (auto *attributes = node->getObject("attributes")) {
+                        DictionaryAttr attributesAttr =
+                            parseJsonObject(*attributes, builder);
+                        if (!attributesAttr) {
+                            llvm::errs()
+                                << "unsupported transform MAPS node: invalid attributes\n";
+                            return {};
+                        }
+                        state.addAttribute("node_attributes", attributesAttr);
+                    }
+                    tileValues[*outputTensorId] =
+                        builder.create(state)->getResult(0);
+                    continue;
+                }
+
                 if (*nodeKind == 3) {
                     llvm::errs() << "unsupported MAPS operation Conv: export an explicit "
                                     "im2col/matmul decomposition before translation\n";
@@ -948,8 +1167,10 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
                 }
 
                 if (*opName == "Add") {
-                    if (inputs->size() < 2)
-                        continue;
+                    if (inputs->size() < 2) {
+                        llvm::errs() << "unsupported Add node: expected two inputs\n";
+                        return {};
+                    }
 
                     auto lhsTensorId = getTensorId((*inputs)[0]);
                     auto rhsTensorId = getTensorId((*inputs)[1]);
@@ -962,6 +1183,61 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
                     Value rhs = tileValues.lookup(*rhsTensorId);
                     if (!lhs || !rhs) {
                         llvm::errs() << "unsupported Add node: missing local input value\n";
+                        return {};
+                    }
+
+                    auto *nodeOutputs = node->getArray("outputs");
+                    auto *nodeOutput = nodeOutputs && !nodeOutputs->empty()
+                                           ? (*nodeOutputs)[0].getAsObject()
+                                           : nullptr;
+                    auto *output = (*outputs)[0].getAsObject();
+                    auto lhsType = dyn_cast<RankedTensorType>(lhs.getType());
+                    if (!nodeOutput || !output || !lhsType) {
+                        llvm::errs() << "unsupported Add node: missing output metadata\n";
+                        return {};
+                    }
+                    auto outputType = parseTileOutputType(
+                        *nodeOutput, *output, tileObj, lhsType.getElementType());
+                    if (!outputType) {
+                        llvm::errs() << "unsupported Add node: invalid output layout\n";
+                        return {};
+                    }
+
+                    auto broadcastToOutput = [&](Value value) -> Value {
+                        auto type = dyn_cast<RankedTensorType>(value.getType());
+                        if (!type || type == *outputType)
+                            return type ? value : Value{};
+                        if (type.getRank() >= outputType->getRank())
+                            return {};
+                        int64_t rankDifference =
+                            outputType->getRank() - type.getRank();
+                        for (int64_t i = 0; i < type.getRank(); ++i) {
+                            if (type.getShape()[i] !=
+                                outputType->getShape()[i + rankDifference])
+                                return {};
+                        }
+                        SmallVector<int64_t> broadcastDimensions;
+                        for (int64_t i = 0; i < rankDifference; ++i)
+                            broadcastDimensions.push_back(i);
+                        Value init = tensor::EmptyOp::create(
+                            builder, loc, outputType->getShape(),
+                            outputType->getElementType()).getResult();
+                        return linalg::BroadcastOp::create(
+                                   builder, loc, value, init, broadcastDimensions)
+                            .getResults()
+                            .front();
+                    };
+                    Type originalLhsType = lhs.getType();
+                    Type originalRhsType = rhs.getType();
+                    lhs = broadcastToOutput(lhs);
+                    rhs = broadcastToOutput(rhs);
+                    if (!lhs || !rhs) {
+                        llvm::errs()
+                            << "unsupported Add node "
+                            << node->getString("name").value_or("<unknown>")
+                            << ": operands are not broadcastable to output layout "
+                            << *outputType << " from " << originalLhsType
+                            << " and " << originalRhsType << "\n";
                         return {};
                     }
 
