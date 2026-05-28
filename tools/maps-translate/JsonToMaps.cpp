@@ -194,23 +194,6 @@ static SmallVector<int64_t> getLocalStartsForSourceTile(ArrayRef<TransitionFragm
 }
 
 
-static unsigned getConcatDim(ArrayRef<TransitionFragment> fragments) {
-    if (fragments.empty())
-        return 0;
-
-    for (auto indexed : llvm::enumerate(fragments.front().dstDims)) {
-        int64_t start = indexed.value().start;
-        bool differs = llvm::any_of(fragments, [&](const TransitionFragment &fragment) {
-            return fragment.dstDims[indexed.index()].start != start;
-        });
-        if (differs)
-            return indexed.index();
-    }
-
-    return 0;
-}
-
-
 static RankedTensorType parseTensorType(const llvm::json::Object &tensor,
                                         OpBuilder &builder) {
 
@@ -874,82 +857,65 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
                     fragments.push_back(*value.first);
                 }
 
-                SmallVector<unsigned> varyingDims;
-                for (auto indexed : llvm::enumerate(fragments.front().dstDims)) {
-                    int64_t start = indexed.value().start;
-                    if (llvm::any_of(fragments, [&](const TransitionFragment &fragment) {
-                            return fragment.dstDims[indexed.index()].start != start;
-                        }))
-                        varyingDims.push_back(indexed.index());
+                SmallVector<int64_t> starts;
+                SmallVector<int64_t> ends;
+
+                for (const SliceDim &dim : fragments.front().dstDims) {
+                    starts.push_back(dim.start);
+                    ends.push_back(dim.start + dim.length);
                 }
 
-                if (varyingDims.size() > 1) {
-                    SmallVector<int64_t> starts;
-                    SmallVector<int64_t> ends;
-                    for (const SliceDim &dim : fragments.front().dstDims) {
-                        starts.push_back(dim.start);
-                        ends.push_back(dim.start + dim.length);
-                    }
-                    for (const TransitionFragment &fragment : fragments) {
-                        for (auto indexed : llvm::enumerate(fragment.dstDims)) {
-                            starts[indexed.index()] =
-                                std::min(starts[indexed.index()], indexed.value().start);
-                            ends[indexed.index()] =
-                                std::max(ends[indexed.index()],
-                                         indexed.value().start + indexed.value().length);
-                        }
-                    }
+                for (const TransitionFragment &fragment : fragments) {
+                    for (auto indexed : llvm::enumerate(fragment.dstDims)) {
+                        starts[indexed.index()] =
+                            std::min(starts[indexed.index()], indexed.value().start);
 
-                    auto firstType = cast<RankedTensorType>(values.front().second.getType());
-                    SmallVector<int64_t> assembledShape;
-                    for (auto indexed : llvm::enumerate(starts))
-                        assembledShape.push_back(ends[indexed.index()] - indexed.value());
-                    Value assembled = tensor::EmptyOp::create(
-                        builder, loc, assembledShape, firstType.getElementType()).getResult();
-
-                    for (const auto &value : values) {
-                        SmallVector<OpFoldResult> offsets;
-                        SmallVector<OpFoldResult> sizes;
-                        SmallVector<OpFoldResult> strides;
-                        for (auto indexed : llvm::enumerate(value.first->dstDims)) {
-                            offsets.push_back(builder.getIndexAttr(
-                                indexed.value().start - starts[indexed.index()]));
-                            sizes.push_back(builder.getIndexAttr(indexed.value().length));
-                            strides.push_back(builder.getIndexAttr(1));
-                        }
-                        assembled = tensor::InsertSliceOp::create(
-                            builder, loc, value.second, assembled, offsets, sizes, strides);
+                        ends[indexed.index()] =
+                            std::max(ends[indexed.index()],
+                                    indexed.value().start + indexed.value().length);
                     }
-                    tileValues[entry.first] = assembled;
-                    continue;
                 }
 
-                unsigned concatDim = getConcatDim(fragments);
-                llvm::sort(values, [concatDim](const auto &lhs, const auto &rhs) {
-                    return lhs.first->dstDims[concatDim].start < rhs.first->dstDims[concatDim].start;
-                });
+                auto firstType = cast<RankedTensorType>(values.front().second.getType());
 
-                SmallVector<Value> inputs;
-                inputs.reserve(values.size());
-                for (const auto &value : values)
-                    inputs.push_back(value.second);
-
-                auto firstType = cast<RankedTensorType>(inputs.front().getType());
-                SmallVector<int64_t> concatShape(firstType.getShape());
-                concatShape[concatDim] = 0;
-                for (Value input : inputs) {
-                    auto inputType = cast<RankedTensorType>(input.getType());
-                    concatShape[concatDim] += inputType.getShape()[concatDim];
+                SmallVector<int64_t> assembledShape;
+                for (auto indexed : llvm::enumerate(starts)) {
+                    assembledShape.push_back(ends[indexed.index()] - indexed.value());
                 }
 
-                auto concatType = RankedTensorType::get(concatShape, firstType.getElementType());
-                tileValues[entry.first] = tensor::ConcatOp::create(
+                Value assembled = tensor::EmptyOp::create(
                     builder,
                     loc,
-                    concatType,
-                    concatDim,
-                    inputs
+                    assembledShape,
+                    firstType.getElementType()
                 ).getResult();
+
+                for (const auto &value : values) {
+                    SmallVector<OpFoldResult> offsets;
+                    SmallVector<OpFoldResult> sizes;
+                    SmallVector<OpFoldResult> strides;
+
+                    for (auto indexed : llvm::enumerate(value.first->dstDims)) {
+                        offsets.push_back(builder.getIndexAttr(
+                            indexed.value().start - starts[indexed.index()]));
+
+                        sizes.push_back(builder.getIndexAttr(indexed.value().length));
+                        strides.push_back(builder.getIndexAttr(1));
+                    }
+
+                    assembled = tensor::InsertSliceOp::create(
+                        builder,
+                        loc,
+                        value.second,
+                        assembled,
+                        offsets,
+                        sizes,
+                        strides
+                    ).getResult();
+                }
+
+                tileValues[entry.first] = assembled;
+                continue;
             }
 
             // load stored values and receive runtime inputs
