@@ -1,2 +1,0 @@
-<?xml version='1.0' encoding='utf-8'?>
-<testsuites name="TTRT" tests="1" failures="0" skipped="0"><testsuite name="TTRT" tests="1" failures="0" skipped="0"><testcase name="" file_path="" result="pass" exception="" log_file="generated/tt_lowered/test/query/query.log" artifacts="generated/tt_lowered/test/query/artifacts" /></testsuite></testsuites>
