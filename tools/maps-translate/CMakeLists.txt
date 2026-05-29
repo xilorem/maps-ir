@@ -16,5 +16,6 @@ target_link_libraries(maps-translate
   MLIRTensorDialect
   MLIRLinalgDialect
   MLIRMathDialect
+  MLIRSCFDialect
   MLIRArithDialect
 )

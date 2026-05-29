@@ -7,6 +7,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 
 // IR constructs
@@ -147,6 +148,383 @@ static DictionaryAttr parseJsonObject(const llvm::json::Object &object,
         attributes.push_back(builder.getNamedAttr(entry.first, attr));
     }
     return builder.getDictionaryAttr(attributes);
+}
+
+static std::optional<SmallVector<int64_t>>
+parseIntArrayField(const llvm::json::Object &object, StringRef fieldName) {
+    auto *array = object.getArray(fieldName);
+    if (!array)
+        return std::nullopt;
+
+    SmallVector<int64_t> values;
+    values.reserve(array->size());
+    for (const llvm::json::Value &entry : *array) {
+        auto value = entry.getAsInteger();
+        if (!value)
+            return std::nullopt;
+        values.push_back(*value);
+    }
+    return values;
+}
+
+static Value createZeroValue(OpBuilder &builder, Location loc, Type type) {
+    return arith::ConstantOp::create(builder, loc, builder.getZeroAttr(type));
+}
+
+static Value createIndexConstant(OpBuilder &builder, Location loc, int64_t value) {
+    return arith::ConstantIndexOp::create(builder, loc, value);
+}
+
+static int64_t ceilDivNonNegative(int64_t dividend, int64_t divisor) {
+    assert(dividend >= 0 && divisor > 0);
+    return (dividend + divisor - 1) / divisor;
+}
+
+static Value emitElementwiseAdd(Location loc, Value lhs, Value rhs,
+                                RankedTensorType outputType,
+                                OpBuilder &builder) {
+    Value init = tensor::EmptyOp::create(
+        builder, loc, outputType.getShape(),
+        outputType.getElementType()).getResult();
+    auto identityMap =
+        AffineMap::getMultiDimIdentityMap(outputType.getRank(), builder.getContext());
+    SmallVector<AffineMap> indexingMaps = {
+        identityMap,
+        identityMap,
+        identityMap,
+    };
+    SmallVector<utils::IteratorType> iteratorTypes(
+        outputType.getRank(), utils::IteratorType::parallel);
+    return linalg::GenericOp::create(
+               builder,
+               loc,
+               outputType,
+               ValueRange{lhs, rhs},
+               ValueRange{init},
+               indexingMaps,
+               iteratorTypes,
+               [&](OpBuilder &nestedBuilder, Location nestedLoc,
+                   ValueRange blockArgs) {
+                   Value add = arith::AddFOp::create(
+                       nestedBuilder, nestedLoc, blockArgs[0], blockArgs[1]);
+                   linalg::YieldOp::create(nestedBuilder, nestedLoc, add);
+               })
+        .getResult(0);
+}
+
+static Value emitElementwiseExp(Location loc, Value input,
+                                RankedTensorType outputType,
+                                OpBuilder &builder) {
+    Value init = tensor::EmptyOp::create(
+        builder, loc, outputType.getShape(),
+        outputType.getElementType()).getResult();
+    auto identityMap =
+        AffineMap::getMultiDimIdentityMap(outputType.getRank(), builder.getContext());
+    SmallVector<AffineMap> indexingMaps = {
+        identityMap,
+        identityMap,
+    };
+    SmallVector<utils::IteratorType> iteratorTypes(
+        outputType.getRank(), utils::IteratorType::parallel);
+    return linalg::GenericOp::create(
+               builder,
+               loc,
+               outputType,
+               ValueRange{input},
+               ValueRange{init},
+               indexingMaps,
+               iteratorTypes,
+               [&](OpBuilder &nestedBuilder, Location nestedLoc,
+                   ValueRange blockArgs) {
+                   Value exp = math::ExpOp::create(
+                       nestedBuilder, nestedLoc, blockArgs[0]);
+                   linalg::YieldOp::create(nestedBuilder, nestedLoc, exp);
+               })
+        .getResult(0);
+}
+
+static FailureOr<Value> emitOutputReformat(Location loc, Value inputValue,
+                                           RankedTensorType outputType,
+                                           OpBuilder &builder) {
+    auto inputType = dyn_cast<RankedTensorType>(inputValue.getType());
+    if (!inputType || inputType.getRank() != 2 || outputType.getRank() != 4)
+        return failure();
+
+    ArrayRef<int64_t> inputShape = inputType.getShape();
+    ArrayRef<int64_t> outputShape = outputType.getShape();
+    if (llvm::any_of(inputShape, ShapedType::isDynamic) ||
+        llvm::any_of(outputShape, ShapedType::isDynamic))
+        return failure();
+
+    int64_t batch = outputShape[0];
+    int64_t channels = outputShape[1];
+    int64_t height = outputShape[2];
+    int64_t width = outputShape[3];
+    if (inputShape[0] != batch * height * width || inputShape[1] != channels)
+        return failure();
+
+    Value assembled = tensor::EmptyOp::create(
+        builder, loc, outputShape, outputType.getElementType()).getResult();
+    auto columnType = RankedTensorType::get(
+        {inputShape[0], 1}, outputType.getElementType());
+    auto flatType = RankedTensorType::get(
+        {inputShape[0]}, outputType.getElementType());
+    auto channelType = RankedTensorType::get(
+        {batch, 1, height, width}, outputType.getElementType());
+    SmallVector<ReassociationIndices> collapseReassociation = {{0, 1}};
+    SmallVector<ReassociationIndices> expandReassociation = {{0, 1, 2, 3}};
+
+    for (int64_t channel = 0; channel < channels; ++channel) {
+        Value columnSlice = tensor::ExtractSliceOp::create(
+            builder,
+            loc,
+            columnType,
+            inputValue,
+            ArrayRef<OpFoldResult>{builder.getIndexAttr(0),
+                                   builder.getIndexAttr(channel)},
+            ArrayRef<OpFoldResult>{builder.getIndexAttr(inputShape[0]),
+                                   builder.getIndexAttr(1)},
+            ArrayRef<OpFoldResult>{builder.getIndexAttr(1),
+                                   builder.getIndexAttr(1)});
+        Value flatColumn = tensor::CollapseShapeOp::create(
+            builder, loc, flatType, columnSlice, collapseReassociation);
+        Value reshapedChannel = tensor::ExpandShapeOp::create(
+            builder, loc, channelType, flatColumn, expandReassociation);
+        assembled = tensor::InsertSliceOp::create(
+            builder,
+            loc,
+            reshapedChannel,
+            assembled,
+            ArrayRef<OpFoldResult>{builder.getIndexAttr(0),
+                                   builder.getIndexAttr(channel),
+                                   builder.getIndexAttr(0),
+                                   builder.getIndexAttr(0)},
+            ArrayRef<OpFoldResult>{builder.getIndexAttr(batch),
+                                   builder.getIndexAttr(1),
+                                   builder.getIndexAttr(height),
+                                   builder.getIndexAttr(width)},
+            ArrayRef<OpFoldResult>{builder.getIndexAttr(1),
+                                   builder.getIndexAttr(1),
+                                   builder.getIndexAttr(1),
+                                   builder.getIndexAttr(1)});
+    }
+
+    return assembled;
+}
+
+static FailureOr<Value> emitWeightPack(Location loc, Value inputValue,
+                                       RankedTensorType outputType,
+                                       OpBuilder &builder) {
+    auto inputType = dyn_cast<RankedTensorType>(inputValue.getType());
+    if (!inputType || inputType.getRank() != 4 || outputType.getRank() != 2)
+        return failure();
+
+    ArrayRef<int64_t> inputShape = inputType.getShape();
+    ArrayRef<int64_t> outputShape = outputType.getShape();
+    if (llvm::any_of(inputShape, ShapedType::isDynamic) ||
+        llvm::any_of(outputShape, ShapedType::isDynamic))
+        return failure();
+
+    int64_t outChannels = inputShape[0];
+    int64_t inChannels = inputShape[1];
+    int64_t kernelHeight = inputShape[2];
+    int64_t kernelWidth = inputShape[3];
+    if (outputShape[0] != inChannels * kernelHeight * kernelWidth ||
+        outputShape[1] != outChannels)
+        return failure();
+
+    auto transposedType = RankedTensorType::get(
+        {inChannels, kernelHeight, kernelWidth, outChannels},
+        outputType.getElementType());
+    Value transposedInit = tensor::EmptyOp::create(
+        builder, loc, transposedType.getShape(),
+        transposedType.getElementType()).getResult();
+    Value transposed = linalg::TransposeOp::create(
+        builder, loc, inputValue, transposedInit,
+        ArrayRef<int64_t>{1, 2, 3, 0}).getResult()[0];
+    SmallVector<ReassociationIndices> reassociation = {{0, 1, 2}, {3}};
+    return tensor::CollapseShapeOp::create(
+        builder, loc, outputType, transposed, reassociation).getResult();
+}
+
+static FailureOr<Value> emitIm2Col(Location loc, Value inputValue,
+                                   const llvm::json::Object &payload,
+                                   RankedTensorType outputType,
+                                   OpBuilder &builder) {
+    auto inputType = dyn_cast<RankedTensorType>(inputValue.getType());
+    if (!inputType || inputType.getRank() != 4 || outputType.getRank() != 2)
+        return failure();
+
+    ArrayRef<int64_t> inputShape = inputType.getShape();
+    ArrayRef<int64_t> outputShape = outputType.getShape();
+    if (llvm::any_of(inputShape, ShapedType::isDynamic) ||
+        llvm::any_of(outputShape, ShapedType::isDynamic))
+        return failure();
+
+    auto kernelShape = parseIntArrayField(payload, "kernel_shape");
+    auto pads = parseIntArrayField(payload, "pads");
+    auto strides = parseIntArrayField(payload, "strides");
+    auto dilations = parseIntArrayField(payload, "dilations");
+    if (!kernelShape || !pads || !strides || !dilations ||
+        kernelShape->size() != 2 || pads->size() != 4 || strides->size() != 2 ||
+        dilations->size() != 2)
+        return failure();
+
+    int64_t batch = inputShape[0];
+    int64_t channels = inputShape[1];
+    int64_t inputHeight = inputShape[2];
+    int64_t inputWidth = inputShape[3];
+    int64_t kernelHeight = (*kernelShape)[0];
+    int64_t kernelWidth = (*kernelShape)[1];
+    int64_t padTop = (*pads)[0];
+    int64_t padLeft = (*pads)[1];
+    int64_t padBottom = (*pads)[2];
+    int64_t padRight = (*pads)[3];
+    int64_t strideY = (*strides)[0];
+    int64_t strideX = (*strides)[1];
+    int64_t dilationY = (*dilations)[0];
+    int64_t dilationX = (*dilations)[1];
+
+    int64_t outputHeight =
+        (inputHeight + padTop + padBottom - dilationY * (kernelHeight - 1) - 1) /
+            strideY +
+        1;
+    int64_t outputWidth =
+        (inputWidth + padLeft + padRight - dilationX * (kernelWidth - 1) - 1) /
+            strideX +
+        1;
+    if (outputShape[0] != batch * outputHeight * outputWidth ||
+        outputShape[1] != channels * kernelHeight * kernelWidth)
+        return failure();
+
+    Value assembled = tensor::EmptyOp::create(
+        builder, loc, outputShape, outputType.getElementType()).getResult();
+    Value zero = createZeroValue(builder, loc, outputType.getElementType());
+    assembled = linalg::FillOp::create(builder, loc, zero, assembled).getResult(0);
+
+    auto spatialType = RankedTensorType::get(
+        {batch, 1, outputHeight, outputWidth}, outputType.getElementType());
+    auto flatColumnType = RankedTensorType::get(
+        {batch * outputHeight * outputWidth}, outputType.getElementType());
+    auto outputColumnType = RankedTensorType::get(
+        {batch * outputHeight * outputWidth, 1}, outputType.getElementType());
+    SmallVector<ReassociationIndices> collapseSpatial = {{0, 1, 2, 3}};
+    SmallVector<ReassociationIndices> expandColumn = {{0, 1}};
+
+    for (int64_t channel = 0; channel < channels; ++channel) {
+        for (int64_t kernelY = 0; kernelY < kernelHeight; ++kernelY) {
+            for (int64_t kernelX = 0; kernelX < kernelWidth; ++kernelX) {
+                int64_t column = (channel * kernelHeight + kernelY) * kernelWidth + kernelX;
+                Value columnTensor = tensor::EmptyOp::create(
+                    builder, loc, spatialType.getShape(),
+                    spatialType.getElementType()).getResult();
+                columnTensor =
+                    linalg::FillOp::create(builder, loc, zero, columnTensor).getResult(0);
+
+                int64_t startY = kernelY * dilationY - padTop;
+                int64_t startX = kernelX * dilationX - padLeft;
+                int64_t validOutYStart =
+                    startY < 0 ? ceilDivNonNegative(-startY, strideY) : 0;
+                int64_t validOutXStart =
+                    startX < 0 ? ceilDivNonNegative(-startX, strideX) : 0;
+                int64_t validOutYEnd =
+                    std::min(outputHeight,
+                             (inputHeight - 1 - startY) / strideY + 1);
+                int64_t validOutXEnd =
+                    std::min(outputWidth,
+                             (inputWidth - 1 - startX) / strideX + 1);
+
+                if (validOutYStart < validOutYEnd && validOutXStart < validOutXEnd) {
+                    int64_t validHeight = validOutYEnd - validOutYStart;
+                    int64_t validWidth = validOutXEnd - validOutXStart;
+                    int64_t inputStartY = startY + validOutYStart * strideY;
+                    int64_t inputStartX = startX + validOutXStart * strideX;
+
+                    auto patchType = RankedTensorType::get(
+                        {batch, 1, validHeight, validWidth},
+                        outputType.getElementType());
+                    Value patch = tensor::ExtractSliceOp::create(
+                        builder,
+                        loc,
+                        patchType,
+                        inputValue,
+                        ArrayRef<OpFoldResult>{builder.getIndexAttr(0),
+                                               builder.getIndexAttr(channel),
+                                               builder.getIndexAttr(inputStartY),
+                                               builder.getIndexAttr(inputStartX)},
+                        ArrayRef<OpFoldResult>{builder.getIndexAttr(batch),
+                                               builder.getIndexAttr(1),
+                                               builder.getIndexAttr(validHeight),
+                                               builder.getIndexAttr(validWidth)},
+                        ArrayRef<OpFoldResult>{builder.getIndexAttr(1),
+                                               builder.getIndexAttr(1),
+                                               builder.getIndexAttr(strideY),
+                                               builder.getIndexAttr(strideX)});
+                    columnTensor = tensor::InsertSliceOp::create(
+                        builder,
+                        loc,
+                        patch,
+                        columnTensor,
+                        ArrayRef<OpFoldResult>{builder.getIndexAttr(0),
+                                               builder.getIndexAttr(0),
+                                               builder.getIndexAttr(validOutYStart),
+                                               builder.getIndexAttr(validOutXStart)},
+                        ArrayRef<OpFoldResult>{builder.getIndexAttr(batch),
+                                               builder.getIndexAttr(1),
+                                               builder.getIndexAttr(validHeight),
+                                               builder.getIndexAttr(validWidth)},
+                        ArrayRef<OpFoldResult>{builder.getIndexAttr(1),
+                                               builder.getIndexAttr(1),
+                                               builder.getIndexAttr(1),
+                                               builder.getIndexAttr(1)});
+                }
+
+                Value flatColumn = tensor::CollapseShapeOp::create(
+                    builder, loc, flatColumnType, columnTensor, collapseSpatial);
+                Value outputColumn = tensor::ExpandShapeOp::create(
+                    builder, loc, outputColumnType, flatColumn, expandColumn);
+                assembled = tensor::InsertSliceOp::create(
+                    builder,
+                    loc,
+                    outputColumn,
+                    assembled,
+                    ArrayRef<OpFoldResult>{builder.getIndexAttr(0),
+                                           builder.getIndexAttr(column)},
+                    ArrayRef<OpFoldResult>{
+                        builder.getIndexAttr(batch * outputHeight * outputWidth),
+                        builder.getIndexAttr(1)},
+                    ArrayRef<OpFoldResult>{builder.getIndexAttr(1),
+                                           builder.getIndexAttr(1)});
+            }
+        }
+    }
+
+    return assembled;
+}
+
+static FailureOr<Value> emitTransformAsStandardOps(
+    Location loc, StringRef opName, ValueRange inputValues,
+    const llvm::json::Object &payload, RankedTensorType outputType,
+    OpBuilder &builder) {
+    if (opName == "Im2Col") {
+        if (inputValues.size() != 1)
+            return failure();
+        return emitIm2Col(loc, inputValues.front(), payload, outputType, builder);
+    }
+
+    if (opName == "WeightPack") {
+        if (inputValues.size() != 1)
+            return failure();
+        return emitWeightPack(loc, inputValues.front(), outputType, builder);
+    }
+
+    if (opName == "OutputReformat") {
+        if (inputValues.size() != 1)
+            return failure();
+        return emitOutputReformat(loc, inputValues.front(), outputType, builder);
+    }
+
+    return failure();
 }
 
 
@@ -544,6 +922,7 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
         tensor::TensorDialect,
         linalg::LinalgDialect,
         math::MathDialect,
+        scf::SCFDialect,
         arith::ArithDialect>();
 
     auto json = llvm::json::parse(input);
@@ -1071,28 +1450,14 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
                         return {};
                     }
 
-                    OperationState state(loc, maps::TransformOp::getOperationName());
-                    state.addOperands(inputValues);
-                    state.addTypes(*outputType);
-                    state.addAttribute("op_name", builder.getStringAttr(*opName));
-                    DictionaryAttr payloadAttr = parseJsonObject(*payload, builder);
-                    if (!payloadAttr) {
-                        llvm::errs() << "unsupported transform MAPS node: invalid payload\n";
+                    auto transformed = emitTransformAsStandardOps(
+                        loc, *opName, inputValues, *payload, *outputType, builder);
+                    if (failed(transformed)) {
+                        llvm::errs() << "unsupported transform MAPS node op_name="
+                                     << *opName << "\n";
                         return {};
                     }
-                    state.addAttribute("payload", payloadAttr);
-                    if (auto *attributes = node->getObject("attributes")) {
-                        DictionaryAttr attributesAttr =
-                            parseJsonObject(*attributes, builder);
-                        if (!attributesAttr) {
-                            llvm::errs()
-                                << "unsupported transform MAPS node: invalid attributes\n";
-                            return {};
-                        }
-                        state.addAttribute("node_attributes", attributesAttr);
-                    }
-                    tileValues[*outputTensorId] =
-                        builder.create(state)->getResult(0);
+                    tileValues[*outputTensorId] = *transformed;
                     continue;
                 }
 
@@ -1127,7 +1492,12 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
                         return {};
                     }
 
-                    Value exp = math::ExpOp::create(builder, loc, inputValue).getResult();
+                    auto inputType = dyn_cast<RankedTensorType>(inputValue.getType());
+                    if (!inputType) {
+                        llvm::errs() << "unsupported Exp node: expected ranked tensor input\n";
+                        return {};
+                    }
+                    Value exp = emitElementwiseExp(loc, inputValue, inputType, builder);
                     tileValues[*outputTensorId] = exp;
                     continue;
                 }
@@ -1207,7 +1577,8 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
                         return {};
                     }
 
-                    Value add = arith::AddFOp::create(builder, loc, lhs, rhs).getResult();
+                    Value add = emitElementwiseAdd(
+                        loc, lhs, rhs, *outputType, builder);
                     tileValues[*outputTensorId] = add;
                     continue;
                 }
@@ -1381,6 +1752,7 @@ void registerJsonToMapsTranslation() {
                             tensor::TensorDialect,
                             linalg::LinalgDialect,
                             math::MathDialect,
+                            scf::SCFDialect,
                             arith::ArithDialect>();
     });
 }

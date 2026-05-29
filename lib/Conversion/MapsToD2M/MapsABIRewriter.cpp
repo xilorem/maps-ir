@@ -85,8 +85,14 @@ static LogicalResult liftParameterSlices(func::FuncOp func) {
   };
 
   SmallVector<SliceInfo> slices;
-  func.walk([&](tensor::ExtractSliceOp slice) {
-    auto arg = dyn_cast<BlockArgument>(slice.getSource());
+  func.walk([&](Operation *op) {
+    auto slice = dyn_cast<tensor::ExtractSliceOp>(op);
+    if (!slice || op->getNumOperands() == 0)
+      return;
+    Value source = op->getOperand(0);
+    if (!source)
+      return;
+    auto arg = dyn_cast<BlockArgument>(source);
     if (!arg || !isParameterArgument(func, arg) || !hasStaticSlice(slice))
       return;
     slices.push_back({arg, slice});
@@ -100,11 +106,11 @@ static LogicalResult liftParameterSlices(func::FuncOp func) {
 
   llvm::StringMap<BlockArgument> liftedArgs;
   for (SliceInfo &info : slices) {
-    auto sourceType = cast<RankedTensorType>(info.slice.getSource().getType());
+    auto sourceType = cast<RankedTensorType>(info.arg.getType());
     if (isIdentityStaticSlice(info.slice.getStaticOffsets(),
                               info.slice.getStaticSizes(),
                               info.slice.getStaticStrides(), sourceType)) {
-      info.slice.replaceAllUsesWith(info.slice.getSource());
+      info.slice.replaceAllUsesWith(info.arg);
       continue;
     }
 

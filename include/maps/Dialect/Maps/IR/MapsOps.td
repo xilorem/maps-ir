@@ -186,22 +186,4 @@ def LoadOp : Maps_Op<"load"> {
   }];
 }
 
-def TransformOp : Maps_Op<"transform"> {
-  let summary = "Apply an exported tensor transform";
-
-  let arguments = (ins
-    Variadic<AnyType>:$inputs,
-    StrAttr:$op_name
-  );
-
-  let results = (outs
-    AnyType:$result
-  );
-
-  let assemblyFormat = [{
-    $op_name `(` $inputs `)` attr-dict `:` functional-type($inputs, $result)
-  }];
-}
-
-
 #endif // MAPS_OPS

@@ -16,6 +16,54 @@
 namespace mlir::maps {
 namespace {
 
+static bool isElementwiseAddGeneric(linalg::GenericOp generic) {
+  if (generic.getNumDpsInputs() != 2 || generic.getNumDpsInits() != 1)
+    return false;
+
+  auto resultType = dyn_cast<RankedTensorType>(generic.getResult(0).getType());
+  if (!resultType)
+    return false;
+
+  auto identityMap =
+      AffineMap::getMultiDimIdentityMap(resultType.getRank(), generic.getContext());
+  if (llvm::any_of(generic.getIndexingMapsArray(),
+                   [&](AffineMap map) { return map != identityMap; }))
+    return false;
+
+  Block &body = generic.getRegion().front();
+  auto add = dyn_cast<arith::AddFOp>(body.front());
+  if (!add)
+    return false;
+  auto yield = dyn_cast<linalg::YieldOp>(add->getNextNode());
+  if (!yield || yield.getNumOperands() != 1 || yield.getOperand(0) != add.getResult())
+    return false;
+  return add->getNextNode() == yield && yield->getNextNode() == nullptr;
+}
+
+static bool isElementwiseExpGeneric(linalg::GenericOp generic) {
+  if (generic.getNumDpsInputs() != 1 || generic.getNumDpsInits() != 1)
+    return false;
+
+  auto resultType = dyn_cast<RankedTensorType>(generic.getResult(0).getType());
+  if (!resultType)
+    return false;
+
+  auto identityMap =
+      AffineMap::getMultiDimIdentityMap(resultType.getRank(), generic.getContext());
+  if (llvm::any_of(generic.getIndexingMapsArray(),
+                   [&](AffineMap map) { return map != identityMap; }))
+    return false;
+
+  Block &body = generic.getRegion().front();
+  auto exp = dyn_cast<math::ExpOp>(body.front());
+  if (!exp)
+    return false;
+  auto yield = dyn_cast<linalg::YieldOp>(exp->getNextNode());
+  if (!yield || yield.getNumOperands() != 1 || yield.getOperand(0) != exp.getResult())
+    return false;
+  return exp->getNextNode() == yield && yield->getNextNode() == nullptr;
+}
+
 static Value createDirectStaticSlice(OpBuilder &builder, Location loc, Value value,
                                      ArrayRef<int64_t> offsets,
                                      ArrayRef<int64_t> sizes) {
@@ -60,6 +108,7 @@ static Value materializeContiguousTensor(OpBuilder &builder, Location loc,
 }
 
 static void inlineRegionOp(PatternRewriter &rewriter, Operation *op) {
+  // take a block outside the region it belongs, useful for wrapper ops like module
   rewriter.inlineBlockBefore(&op->getRegion(0).front(), op);
   rewriter.eraseOp(op);
 }
@@ -97,6 +146,7 @@ static LogicalResult lowerInitTile(maps::TileOp tile, PatternRewriter &rewriter)
 static FailureOr<bool> lowerComputeTile(
     maps::TileOp tile, DenseMap<Attribute, ChannelInfo> &channels,
     DenseMap<Attribute, Value> &channelValues,
+    DenseMap<Attribute, Value> &logicalChannelValues,
     DenseMap<Attribute, SmallVector<Value>> &channelValueLists,
     DenseMap<Attribute, Value> &slotValues,
     DenseMap<int64_t, SmallVector<Attribute>> &stageChannels,
@@ -132,6 +182,53 @@ static FailureOr<bool> lowerComputeTile(
     return value;
   };
 
+  DenseMap<Value, Value> hoistedValues;
+  std::function<FailureOr<Value>(Value)> hoistValue = [&](Value value) -> FailureOr<Value> {
+    if (auto recv = value.getDefiningOp<maps::RecvOp>()) {
+      auto channelIt = channels.find(recv.getChannelAttr());
+      if (channelIt == channels.end())
+        return recv.emitOpError("missing channel info");
+      if (channelIt->second.srcHartId == -1)
+        return channelIt->second.send.getValue();
+
+      auto valueIt = logicalChannelValues.find(recv.getChannelAttr());
+      if (valueIt == logicalChannelValues.end())
+        return failure();
+      return valueIt->second;
+    }
+
+    if (auto load = value.getDefiningOp<maps::LoadOp>()) {
+      auto slotIt = slotValues.find(load.getSlotAttr());
+      if (slotIt == slotValues.end())
+        return load.emitOpError("expected lowered slot value");
+      return slotIt->second;
+    }
+
+    auto cached = hoistedValues.find(value);
+    if (cached != hoistedValues.end())
+      return cached->second;
+
+    Operation *definingOp = value.getDefiningOp();
+    if (!definingOp || definingOp->getBlock() != &tile.getBody().front())
+      return value;
+
+    IRMapping mapping;
+    for (Value operand : definingOp->getOperands()) {
+      auto hoistedOperand = hoistValue(operand);
+      if (failed(hoistedOperand))
+        return failure();
+      mapping.map(operand, *hoistedOperand);
+    }
+
+    rewriter.setInsertionPoint(tile);
+    Operation *cloned = rewriter.clone(*definingOp, mapping);
+    for (auto [original, replacement] :
+         llvm::zip_equal(definingOp->getResults(), cloned->getResults())) {
+      hoistedValues[original] = replacement;
+    }
+    return hoistedValues.lookup(value);
+  };
+
   D2MGenericBuilder builder(rewriter.getContext(), rewriter);
   using OptionalValue = std::optional<Value>;
   std::function<FailureOr<OptionalValue>(
@@ -153,8 +250,8 @@ static FailureOr<bool> lowerComputeTile(
     }
 
     if (auto matmul = value.getDefiningOp<linalg::MatmulOp>()) {
-      auto lhsSource = getSourceValue(matmul.getInputs()[0]);
-      auto rhsSource = getSourceValue(matmul.getInputs()[1]);
+      auto lhsSource = hoistValue(matmul.getInputs()[0]);
+      auto rhsSource = hoistValue(matmul.getInputs()[1]);
       if (failed(lhsSource) || failed(rhsSource))
         return OptionalValue();
 
@@ -182,12 +279,7 @@ static FailureOr<bool> lowerComputeTile(
           return OptionalValue(matmulGeneric->getResult(0));
         }
 
-        Operation *definingOp = value.getDefiningOp();
-        if (definingOp && !isa<maps::RecvOp, maps::LoadOp>(definingOp))
-          return definingOp->emitOpError(
-              "unsupported nested compute producer in MAPS-to-D2M lowering");
-
-        auto sourceValue = getSourceValue(value);
+        auto sourceValue = hoistValue(value);
         if (failed(sourceValue))
           return OptionalValue();
 
@@ -205,6 +297,11 @@ static FailureOr<bool> lowerComputeTile(
       };
 
   for (maps::SendOp send : sends) {
+    auto hoistedSendValue = hoistValue(send.getValue());
+    if (failed(hoistedSendValue))
+      return success(false);
+    logicalChannelValues[send.getChannelAttr()] = *hoistedSendValue;
+
     auto outputType = cast<RankedTensorType>(send.getValue().getType());
     Value sendValue = send.getValue();
     auto sendSlice = sendValue.getDefiningOp<tensor::ExtractSliceOp>();
@@ -239,7 +336,7 @@ static FailureOr<bool> lowerComputeTile(
 
         for (Value concatInput : concat.getInputs()) {
           rewriter.setInsertionPoint(tile);
-          auto concatInputValue = getSourceValue(concatInput);
+          auto concatInputValue = hoistValue(concatInput);
           if (failed(concatInputValue))
             return success(false);
 
@@ -274,8 +371,8 @@ static FailureOr<bool> lowerComputeTile(
         channelValueLists[send.getChannelAttr()] = shardResults;
       } else {
         rewriter.setInsertionPoint(tile);
-        auto lhsValue = getSourceValue(add.getLhs());
-        auto rhsValue = getSourceValue(add.getRhs());
+        auto lhsValue = hoistValue(add.getLhs());
+        auto rhsValue = hoistValue(add.getRhs());
         if (failed(lhsValue) || failed(rhsValue))
           return success(false);
 
@@ -292,7 +389,12 @@ static FailureOr<bool> lowerComputeTile(
         channelValueLists[send.getChannelAttr()] = {addGeneric->getResult(0)};
       }
     } else {
-      return send.emitOpError("unsupported compute tile send pattern");
+      rewriter.setInsertionPoint(tile);
+      auto tiledValue = builder.getTiledValue(*hoistedSendValue);
+      if (failed(tiledValue))
+        return send.emitOpError("failed to materialize generic send value");
+      channelValues[send.getChannelAttr()] = *tiledValue;
+      channelValueLists[send.getChannelAttr()] = {*tiledValue};
     }
 
     auto stageIt = tileStageIds.find(tile.getOperation());
@@ -307,10 +409,13 @@ static FailureOr<bool> lowerComputeTile(
 
 } // namespace
 
+
+// main entry point
 LogicalResult lowerMapsProgramToD2M(ModuleOp module,
                                     MapsProgramInfo &program,
                                     ChannelLoweringState &state) {
-  PatternRewriter rewriter(module.getContext());
+  PatternRewriter rewriter(module.getContext()); //
+  DenseMap<Attribute, Value> logicalChannelValues;
   DenseMap<Operation *, int64_t> tileStageIds;
   for (StageInfo &stage : program.stages) {
     for (TileInfo &tile : stage.tiles)
@@ -318,7 +423,8 @@ LogicalResult lowerMapsProgramToD2M(ModuleOp module,
   }
 
   // Inline the MAPS structural wrappers.
-  rewriter.setInsertionPoint(program.init);
+  // setInsertionPoint sets the "cursor" of the patternRewriter to the specific op loc
+  rewriter.setInsertionPoint(program.init); 
   inlineRegionOp(rewriter, program.init);
   rewriter.setInsertionPoint(program.run);
   inlineRegionOp(rewriter, program.run);
@@ -330,6 +436,7 @@ LogicalResult lowerMapsProgramToD2M(ModuleOp module,
   // Drop storage-only tiles now that slot values have been analyzed.
   SmallVector<maps::TileOp> initTiles;
   SmallVector<maps::TileOp> pendingTiles;
+
   module.walk([&](maps::TileOp tile) {
     if (isInitStorageTile(tile)) {
       initTiles.push_back(tile);
@@ -339,6 +446,7 @@ LogicalResult lowerMapsProgramToD2M(ModuleOp module,
   });
 
   for (maps::TileOp tile : initTiles) {
+    // entry point for lowering initialization tiles (no compute)
     if (failed(lowerInitTile(tile, rewriter)))
       return failure();
   }
@@ -350,7 +458,8 @@ LogicalResult lowerMapsProgramToD2M(ModuleOp module,
 
     for (maps::TileOp tile : pendingTiles) {
       auto lowered = lowerComputeTile(tile, program.channels, state.values,
-                                      state.valueLists, program.slotValues,
+                                      logicalChannelValues, state.valueLists,
+                                      program.slotValues,
                                       state.stageChannels, tileStageIds,
                                       rewriter);
       if (failed(lowered))

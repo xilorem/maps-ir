@@ -22,7 +22,9 @@ static bool isIdentityStaticSlice(ArrayRef<int64_t> offsets,
 }
 
 static bool foldIdentitySlice(tensor::ExtractSliceOp slice) {
-  auto sourceType = dyn_cast<RankedTensorType>(slice.getSource().getType());
+  if (slice->getNumOperands() == 0 || !slice->getOperand(0))
+    return false;
+  auto sourceType = dyn_cast<RankedTensorType>(slice->getOperand(0).getType());
   if (!sourceType || !hasStaticSlice(slice))
     return false;
   if (!isIdentityStaticSlice(slice.getStaticOffsets(), slice.getStaticSizes(),
@@ -30,7 +32,7 @@ static bool foldIdentitySlice(tensor::ExtractSliceOp slice) {
     return false;
   }
 
-  slice.replaceAllUsesWith(slice.getSource());
+  slice.replaceAllUsesWith(slice->getOperand(0));
   return true;
 }
 

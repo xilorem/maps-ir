@@ -17,4 +17,18 @@ def ConvertMapsToD2M : Pass<"convert-maps-to-d2m", "mlir::ModuleOp"> {
   ];
 }
 
+def LowerStandaloneLinalgElementwise
+    : Pass<"lower-standalone-linalg-elementwise", "mlir::func::FuncOp"> {
+  let summary = "Lower standalone memref elementwise linalg.generic ops";
+  let dependentDialects = [
+    "::mlir::func::FuncDialect",
+    "::mlir::linalg::LinalgDialect",
+    "::mlir::arith::ArithDialect",
+    "::mlir::math::MathDialect",
+    "::mlir::memref::MemRefDialect",
+    "::mlir::scf::SCFDialect",
+    "::mlir::tt::d2m::D2MDialect"
+  ];
+}
+
 #endif // MAPS_PASS

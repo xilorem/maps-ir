@@ -1,6 +1,7 @@
 add_mlir_library(MLIRMapsToD2M
   D2MGenericBuilder.cpp
   D2MTypeUtils.cpp
+  LowerStandaloneLinalgElementwise.cpp
   MapsABIRewriter.cpp
   MapsCleanup.cpp
   MapsPatternLowering.cpp
@@ -18,7 +19,9 @@ add_mlir_library(MLIRMapsToD2M
   TTMLIR::MLIRTTIRDialect
   TTMLIR::MLIRTTNNDialect
   MLIRIR
+  MLIRMemRefDialect
   MLIRPass
+  MLIRSCFDialect
 )
 
 target_include_directories(MLIRMapsToD2M
