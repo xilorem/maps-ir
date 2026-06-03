@@ -1,3 +1,5 @@
+// Main entry point for the MAPS to D2M conversion pipeline.
+
 #include "maps/Conversion/Passes.h"
 #include "maps/Conversion/MapsToD2M/MapsABIRewriter.h"
 #include "maps/Conversion/MapsToD2M/MapsCleanup.h"

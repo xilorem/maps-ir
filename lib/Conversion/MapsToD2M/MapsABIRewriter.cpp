@@ -11,7 +11,10 @@ namespace mlir::maps {
 namespace {
 
 static BlockArgument getRootBlockArgument(Value value) {
-  while (Operation *def = value.getDefiningOp()) {
+  /*This function checks if a value is originally derived from a block argument;
+  if it is, it returns the value as a block argument. If it isn't it returns an empty BlockArgument.*/
+
+  while (Operation *def = value.getDefiningOp()) { // loop iteratively through single-operand operations
     if (def->getNumOperands() != 1)
       return {};
     value = def->getOperand(0);
@@ -20,20 +23,26 @@ static BlockArgument getRootBlockArgument(Value value) {
 }
 
 static void annotateForwardFunc(func::FuncOp func, MapsProgramInfo &program) {
-  MLIRContext *ctx = func.getContext();
+  MLIRContext *ctx = func.getContext(); // get context before modifying the function to avoid invalidating it
   func->setAttr("tt.function_type", StringAttr::get(ctx, "forward_device"));
   if (func.getSymName() == "main")
     func.setSymName("forward");
 
-  DenseSet<unsigned> parameterArgs;
+  // creates set of function argument indices that are parameters (i.e. passed to sends in the init stage)
+  DenseSet<unsigned> parameterArgs; 
   if (program.init) {
+    /*program.init.walk() literally walks through all operations in the init phase;
+    it then applies a lambda function to each maps::SendOp operation it finds.
+    A value in mlir can either be an OpResult type or a BlockArgument type,
+    */
     program.init.walk([&](maps::SendOp send) {
-      if (BlockArgument arg = getRootBlockArgument(send.getValue()))
+      if (BlockArgument arg = getRootBlockArgument(send.getValue())) // check if the value is a block argument
         parameterArgs.insert(arg.getArgNumber());
     });
   }
 
   for (BlockArgument arg : func.getArguments()) {
+    // if the argument is in parameterArgs, annotate it as a parameter; otherwise, annotate it as an input
     auto argType = parameterArgs.contains(arg.getArgNumber())
                        ? mlir::tt::ttcore::ArgumentType::Parameter
                        : mlir::tt::ttcore::ArgumentType::Input;
