@@ -17,6 +17,23 @@ def ConvertMapsToD2M : Pass<"convert-maps-to-d2m", "mlir::ModuleOp"> {
   ];
 }
 
+def PrintMapsProgramAnalysis
+    : Pass<"print-maps-program-analysis", "mlir::ModuleOp"> {
+  let summary = "Print structured MAPS program analysis";
+  let dependentDialects = [
+    "::mlir::maps::MapsDialect"
+  ];
+}
+
+def PrintMapsPlacementAnalysis
+    : Pass<"print-maps-placement-analysis", "mlir::ModuleOp"> {
+  let summary = "Print structured MAPS placement analysis";
+  let dependentDialects = [
+    "::mlir::maps::MapsDialect",
+    "::mlir::tt::ttcore::TTCoreDialect"
+  ];
+}
+
 def LowerStandaloneLinalgElementwise
     : Pass<"lower-standalone-linalg-elementwise", "mlir::func::FuncOp"> {
   let summary = "Lower standalone memref elementwise linalg.generic ops";

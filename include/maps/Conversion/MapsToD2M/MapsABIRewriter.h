@@ -1,7 +1,7 @@
 #ifndef MAPS_CONVERSION_MAPSTOD2M_MAPSABIREWRITER_H
 #define MAPS_CONVERSION_MAPSTOD2M_MAPSABIREWRITER_H
 
-#include "maps/Conversion/MapsToD2M/MapsPatternLowering.h"
+#include "maps/Conversion/MapsToD2M/ComputeEmitter.h"
 
 namespace mlir::maps {
 

@@ -1,6 +1,7 @@
 #include "maps/Conversion/MapsToD2M/D2MGenericBuilder.h"
 
 #include "maps/Conversion/MapsToD2M/D2MTypeUtils.h"
+#include "maps/Conversion/MapsToD2M/TileBodyEmitter.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "ttmlir/Dialect/D2M/IR/D2MGenericRegionOps.h"
 
@@ -148,6 +149,88 @@ FailureOr<mlir::tt::d2m::GenericOp> D2MGenericBuilder::createAddGeneric(
                                        bbArgs[0], bbArgs[1])
                                    .getResult();
                              });
+  return generic;
+}
+
+FailureOr<mlir::tt::d2m::GenericOp> D2MGenericBuilder::createLinalgGeneric(
+    Location loc, ArrayRef<Value> inputs, RankedTensorType logicalOutputType,
+    linalg::GenericOp sourceGeneric) {
+  SmallVector<AffineMap> indexingMaps;
+  for (AffineMap map : sourceGeneric.getIndexingMapsArray())
+    indexingMaps.push_back(map);
+
+  SmallVector<Attribute> iteratorAttrs;
+  SmallVector<mlir::utils::IteratorType> linalgIterators;
+  for (mlir::utils::IteratorType iteratorType :
+       sourceGeneric.getIteratorTypesArray()) {
+    linalgIterators.push_back(iteratorType);
+
+    auto ttIterator = iteratorType == mlir::utils::IteratorType::parallel
+                          ? mlir::tt::ttcore::IteratorType::Parallel
+                          : mlir::tt::ttcore::IteratorType::Reduction;
+    iteratorAttrs.push_back(
+        mlir::tt::ttcore::IteratorTypeAttr::get(ctx, ttIterator));
+  }
+
+  auto outputType = getTiledDeviceTensorType(ctx, logicalOutputType);
+  auto generic =
+      createGeneric(loc, inputs, outputType, indexingMaps, iteratorAttrs);
+
+  auto insertPoint = rewriter.saveInsertionPoint();
+  rewriter.startOpModification(generic);
+  {
+    Region &region = generic.getRegion(0);
+    Block *block = rewriter.createBlock(&region);
+    SmallVector<Value> blockArgs = createGenericBlockArguments(
+        generic, TypeRange(generic.getInputs().getTypes()),
+        TypeRange(generic.getOutputs().getTypes()));
+    rewriter.setInsertionPointToEnd(block);
+
+    auto shardType = cast<RankedTensorType>(blockArgs.back().getType());
+    auto linalg = rewriter.create<linalg::GenericOp>(
+        generic.getLoc(), TypeRange{shardType}, ValueRange(blockArgs).drop_back(),
+        ValueRange{blockArgs.back()}, indexingMaps, linalgIterators,
+        [&](OpBuilder &builder, Location bodyLoc, ValueRange bbArgs) {
+          IRMapping mapping;
+          Block &sourceBlock = sourceGeneric.getRegion().front();
+          for (auto [sourceArg, targetArg] :
+               llvm::zip_equal(sourceBlock.getArguments(), bbArgs)) {
+            mapping.map(sourceArg, targetArg);
+          }
+
+          PatternRewriter::InsertionGuard guard(rewriter);
+          rewriter.setInsertionPointToEnd(builder.getBlock());
+          for (Operation &op : sourceBlock.without_terminator()) {
+            if (failed(lowerTileBodyOp(rewriter, &op, mapping))) {
+              sourceGeneric.emitOpError(
+                  "unsupported linalg.generic body op for D2M lowering");
+              return;
+            }
+          }
+
+          auto yield = cast<linalg::YieldOp>(sourceBlock.getTerminator());
+          Value yielded = mapping.lookupOrNull(yield.getValues().front());
+          if (!yielded) {
+            (void)sourceGeneric.emitOpError(
+                "failed to map linalg.generic yield value");
+            return;
+          }
+          builder.create<linalg::YieldOp>(bodyLoc, yielded);
+        });
+
+    SmallVector<Value> outputIndices = mlir::tt::d2m::utils::buildGridIndices(
+        rewriter, generic.getLoc(),
+        generic.getIndexingMap(generic.getNumOperands() - 1));
+    Value stored = rewriter
+                       .create<mlir::tt::d2m::RemoteStoreOp>(
+                           generic.getLoc(), generic.getResult(0).getType(),
+                           generic.getOutputs().front(), outputIndices,
+                           linalg.getResult(0))
+                       .getResult();
+    rewriter.create<mlir::tt::d2m::YieldOp>(generic.getLoc(), stored);
+  }
+  rewriter.finalizeOpModification(generic);
+  rewriter.restoreInsertionPoint(insertPoint);
   return generic;
 }
 

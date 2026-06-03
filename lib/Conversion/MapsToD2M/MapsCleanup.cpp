@@ -1,5 +1,6 @@
 #include "maps/Conversion/MapsToD2M/MapsCleanup.h"
 
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/PatternMatch.h"
 
@@ -74,8 +75,9 @@ void cleanupGeneratedIR(ModuleOp module) {
 
     SmallVector<Operation *> deadOps;
     module.walk([&](Operation *op) {
-      if (op->use_empty() &&
-          isa<tensor::ExtractSliceOp, tensor::InsertSliceOp, tensor::EmptyOp>(op)) {
+      if (isa<ModuleOp>(op))
+        return;
+      if (isOpTriviallyDead(op)) {
         deadOps.push_back(op);
       }
     });

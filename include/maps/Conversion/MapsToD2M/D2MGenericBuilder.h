@@ -1,6 +1,7 @@
 #ifndef MAPS_CONVERSION_MAPSTOD2M_D2MGENERICBUILDER_H
 #define MAPS_CONVERSION_MAPSTOD2M_D2MGENERICBUILDER_H
 
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "ttmlir/Dialect/D2M/IR/D2MOps.h"
 
 namespace mlir::maps {
@@ -22,6 +23,11 @@ public:
   FailureOr<mlir::tt::d2m::GenericOp>
   createAddGeneric(Location loc, Value lhs, Value rhs,
                    RankedTensorType logicalOutputType);
+
+  FailureOr<mlir::tt::d2m::GenericOp>
+  createLinalgGeneric(Location loc, ArrayRef<Value> inputs,
+                      RankedTensorType logicalOutputType,
+                      linalg::GenericOp sourceGeneric);
 
 private:
   SmallVector<Value> createGenericBlockArguments(mlir::tt::d2m::GenericOp generic,
