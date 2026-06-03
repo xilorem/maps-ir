@@ -10,17 +10,22 @@
 namespace mlir::maps {
 
 struct ComputeOpLoweringContext {
-  maps::TileOp tile;
-  D2MGenericBuilder &builder;
-  PatternRewriter &rewriter;
-  std::function<FailureOr<Value>(Value)> getSourceValue;
-  std::function<FailureOr<Value>(Value)> hoistValue;
+  /* This struct contains all the information needed to lower a compute operation
+  inside a maps.tile. It is passed to the registered compute op emitters to perform the lowering
+  */
+
+  maps::TileOp tile; // which tile computes the op
+  D2MGenericBuilder &builder; // custom builder for creating d2m.generic ops
+  PatternRewriter &rewriter; // generic mlir rewrite helper
+  std::function<FailureOr<Value>(Value)> getSourceValue; // given a value, what's the source value that should be used for the lowering 
+                                                         //(e.g. for recv and load ops we need to look for the corresponding channel/slot value)
+  std::function<FailureOr<Value>(Value)> hoistValue;  
   std::function<FailureOr<std::optional<Value>>(Value, RankedTensorType,
                                                 tensor::ExtractSliceOp)>
-      lowerValue;
+      lowerValue; // recursive lowering function
   std::function<Value(Location, Value, ArrayRef<int64_t>, ArrayRef<int64_t>)>
-      createStaticSlice;
-  std::function<Value(Location, Value)> materializeContiguous;
+      createStaticSlice; // conceptually, source tensor + offsets + sizes -> tensor.extract_slice
+  std::function<Value(Location, Value)> materializeContiguous; // takes a tensor value, often a slice/view-like value, and materializes it into a standalone contiguous tensor.
 };
 
 class ComputeOpEmitter {

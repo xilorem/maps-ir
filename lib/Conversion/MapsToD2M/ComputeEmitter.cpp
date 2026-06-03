@@ -78,26 +78,41 @@ FailureOr<bool> lowerComputeTileProgram(
     DenseMap<Operation *, mlir::tt::ttcore::CoreRangeAttr> &tileCoreRanges,
     DenseMap<int64_t, SmallVector<Attribute>> &stageChannels,
     DenseMap<Operation *, int64_t> &tileStageIds, PatternRewriter &rewriter) {
-  SmallVector<maps::SendOp> sends;
+
+  SmallVector<maps::SendOp> sends; // all compute tiles should have at least one send op in the top level
+
+  // collect tile outs
   for (Operation &nested : tile.getBody().front()) {
     if (auto send = dyn_cast<maps::SendOp>(nested))
       sends.push_back(send);
   }
 
   auto getSourceValue = [&](Value value) -> FailureOr<Value> {
+    /* small lambda for resolving the source for a given value;
+    It handles three cases
+    - value comes from a maps.recv from another tile: we look for the the corresponding channel info and return the value that will be used to send the data from the other tile to this tile
+    - value comes from a maps.recv from the host: we look for the corresponding channel info and return the send value that will be used to send the data from the host to the device
+    - value comes from a maps.load: we look for the corresponding slot value
+    */
+
+    // comes from maps.recv case
     if (auto recv = value.getDefiningOp<maps::RecvOp>()) {
       auto channelIt = channels.find(recv.getChannelAttr());
       if (channelIt == channels.end())
         return recv.emitOpError("missing channel info");
+      
+      // comes from host case
       if (channelIt->second.srcHartId == -1)
         return channelIt->second.send.getValue();
 
+      // comes from another tile case
       auto valueIt = channelValues.find(recv.getChannelAttr());
       if (valueIt == channelValues.end())
         return failure();
       return valueIt->second;
     }
 
+    // comes from maps.load case
     if (auto load = value.getDefiningOp<maps::LoadOp>()) {
       auto slotIt = slotValues.find(load.getSlotAttr());
       if (slotIt == slotValues.end())
@@ -108,7 +123,7 @@ FailureOr<bool> lowerComputeTileProgram(
     return value;
   };
 
-  DenseMap<Value, Value> hoistedValues;
+  DenseMap<Value, Value> hoistedValues; // value map to avoid recloning the same value multiple times when hoisting
   std::function<FailureOr<Value>(Value)> hoistValue = [&](Value value) -> FailureOr<Value> {
     if (auto recv = value.getDefiningOp<maps::RecvOp>()) {
       auto channelIt = channels.find(recv.getChannelAttr());
