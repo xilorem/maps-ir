@@ -8,6 +8,8 @@ namespace mlir::maps {
 
 mlir::tt::ttcore::MetalLayoutAttr getL1ShardedLayout(MLIRContext *ctx,
                                                      RankedTensorType type);
+RankedTensorType getScalarDeviceTensorType(MLIRContext *ctx,
+                                           RankedTensorType type);
 RankedTensorType getTiledDeviceTensorType(MLIRContext *ctx,
                                           RankedTensorType type);
 RankedTensorType getShardTensorType(RankedTensorType type);

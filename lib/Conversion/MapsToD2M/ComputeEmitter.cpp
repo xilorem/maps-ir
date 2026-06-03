@@ -83,6 +83,104 @@ static void eraseBlockOps(PatternRewriter &rewriter, Block &body) {
   }
 }
 
+struct CompositeAssemblyPiece {
+  Value value;
+  RankedTensorType type;
+};
+
+static FailureOr<std::optional<std::pair<int64_t, SmallVector<CompositeAssemblyPiece>>>>
+collectCompositeAssembly(Value value) {
+  auto insertSlice = value.getDefiningOp<tensor::InsertSliceOp>();
+  if (!insertSlice)
+    return std::optional<std::pair<int64_t, SmallVector<CompositeAssemblyPiece>>>();
+
+  auto destType = dyn_cast<RankedTensorType>(insertSlice.getDest().getType());
+  auto sourceType = dyn_cast<RankedTensorType>(insertSlice.getSource().getType());
+  if (!destType || !sourceType || sourceType.getRank() != destType.getRank())
+    return std::optional<std::pair<int64_t, SmallVector<CompositeAssemblyPiece>>>();
+  int64_t concatDim = -1;
+  auto offsets = insertSlice.getStaticOffsets();
+  auto sizes = insertSlice.getStaticSizes();
+  auto strides = insertSlice.getStaticStrides();
+  if (llvm::is_contained(offsets, ShapedType::kDynamic) ||
+      llvm::is_contained(sizes, ShapedType::kDynamic) ||
+      llvm::is_contained(strides, ShapedType::kDynamic))
+    return std::optional<std::pair<int64_t, SmallVector<CompositeAssemblyPiece>>>();
+  auto destShape = destType.getShape();
+  for (size_t index = 0; index < offsets.size(); ++index) {
+    int64_t offset = offsets[index];
+    int64_t size = sizes[index];
+    int64_t stride = strides[index];
+    int64_t destSize = destShape[index];
+    if (stride != 1)
+      return std::optional<std::pair<int64_t, SmallVector<CompositeAssemblyPiece>>>();
+    if (offset != 0 || size != destSize) {
+      if (concatDim != -1)
+        return std::optional<std::pair<int64_t, SmallVector<CompositeAssemblyPiece>>>();
+      concatDim = static_cast<int64_t>(index);
+    }
+  }
+  if (concatDim == -1)
+    return std::optional<std::pair<int64_t, SmallVector<CompositeAssemblyPiece>>>();
+
+  SmallVector<CompositeAssemblyPiece> pieces;
+  int64_t expectedOffset = 0;
+  std::function<LogicalResult(Value)> walkAssembly = [&](Value current) {
+    if (current.getDefiningOp<tensor::EmptyOp>())
+      return success();
+
+    auto currentInsert = current.getDefiningOp<tensor::InsertSliceOp>();
+    if (!currentInsert)
+      return failure();
+
+    if (failed(walkAssembly(currentInsert.getDest())))
+      return failure();
+
+    auto currentDestType =
+        dyn_cast<RankedTensorType>(currentInsert.getDest().getType());
+    auto currentSourceType =
+        dyn_cast<RankedTensorType>(currentInsert.getSource().getType());
+    if (!currentDestType || !currentSourceType ||
+        currentSourceType.getRank() != currentDestType.getRank())
+      return failure();
+    auto currentOffsets = currentInsert.getStaticOffsets();
+    auto currentSizes = currentInsert.getStaticSizes();
+    auto currentStrides = currentInsert.getStaticStrides();
+    if (llvm::is_contained(currentOffsets, ShapedType::kDynamic) ||
+        llvm::is_contained(currentSizes, ShapedType::kDynamic) ||
+        llvm::is_contained(currentStrides, ShapedType::kDynamic))
+      return failure();
+    auto currentDestShape = currentDestType.getShape();
+    for (size_t index = 0; index < currentOffsets.size(); ++index) {
+      int64_t offset = currentOffsets[index];
+      int64_t size = currentSizes[index];
+      int64_t stride = currentStrides[index];
+      int64_t destSize = currentDestShape[index];
+      if (stride != 1)
+        return failure();
+      if (static_cast<int64_t>(index) == concatDim) {
+        if (offset != expectedOffset)
+          return failure();
+        expectedOffset += size;
+        continue;
+      }
+      if (offset != 0 || size != destSize)
+        return failure();
+    }
+
+    pieces.push_back(
+        {.value = currentInsert.getSource(), .type = currentSourceType});
+    return success();
+  };
+
+  if (failed(walkAssembly(value)))
+    return std::optional<std::pair<int64_t, SmallVector<CompositeAssemblyPiece>>>();
+  if (expectedOffset != destType.getShape()[concatDim])
+    return std::optional<std::pair<int64_t, SmallVector<CompositeAssemblyPiece>>>();
+  return std::optional<std::pair<int64_t, SmallVector<CompositeAssemblyPiece>>>(
+      std::make_pair(concatDim, std::move(pieces)));
+}
+
 } // namespace
 
 FailureOr<bool> lowerComputeTileProgram(
@@ -234,9 +332,14 @@ FailureOr<bool> lowerComputeTileProgram(
     if (!valueType.getEncoding())
       return value;
 
+    auto scalarDeviceType =
+        getScalarDeviceTensorType(rewriter.getContext(), logicalType);
+    if (valueType == scalarDeviceType)
+      return value;
+
     auto logicalOutput = rewriter.create<mlir::tt::d2m::EmptyOp>(
-        loc, logicalType.getShape(), logicalType.getElementType(),
-        logicalType.getEncoding());
+        loc, scalarDeviceType.getShape(), scalarDeviceType.getElementType(),
+        scalarDeviceType.getEncoding());
     auto toLayout = rewriter.create<mlir::tt::d2m::ToLayoutOp>(
         loc, value, logicalOutput.getResult());
     return toLayout.getResult(0);
@@ -289,6 +392,42 @@ FailureOr<bool> lowerComputeTileProgram(
           cast<RankedTensorType>(insertSlice.getSource().getType());
       auto destType = cast<RankedTensorType>(insertSlice.getDest().getType());
 
+      auto compositeAssembly = collectCompositeAssembly(value);
+      if (failed(compositeAssembly))
+        return failure();
+      if (*compositeAssembly) {
+        auto [concatDim, pieces] = **compositeAssembly;
+        SmallVector<Value> scalarInputs;
+        SmallVector<int64_t> logicalSizes;
+        scalarInputs.reserve(pieces.size());
+        logicalSizes.reserve(pieces.size());
+        for (const CompositeAssemblyPiece &piece : pieces) {
+          auto loweredPiece =
+              lowerValue(piece.value, piece.type, tensor::ExtractSliceOp());
+          if (failed(loweredPiece) || !*loweredPiece)
+            return OptionalValue();
+
+          auto scalarPiece = materializeLogicalValue(insertSlice.getLoc(),
+                                                     **loweredPiece, piece.type);
+          if (failed(scalarPiece))
+            return insertSlice.emitOpError(
+                "failed to materialize stitched input shard");
+          scalarInputs.push_back(*scalarPiece);
+          logicalSizes.push_back(piece.type.getShape()[concatDim]);
+        }
+
+        auto scalarDestType = getScalarDeviceTensorType(rewriter.getContext(),
+                                                        destType);
+        auto stitched = rewriter.create<mlir::tt::d2m::CompositeViewOp>(
+            insertSlice.getLoc(), scalarDestType, scalarInputs, concatDim,
+            rewriter.getDenseI64ArrayAttr(logicalSizes));
+        auto tiledAssembled = builder.getTiledValue(stitched.getResult());
+        if (failed(tiledAssembled))
+          return insertSlice.emitOpError(
+              "failed to materialize tiled stitched tensor");
+        return OptionalValue(*tiledAssembled);
+      }
+
       auto loweredSource =
           lowerValue(insertSlice.getSource(), sourceType, tensor::ExtractSliceOp());
       auto loweredDest =
@@ -305,10 +444,23 @@ FailureOr<bool> lowerComputeTileProgram(
         return insertSlice.emitOpError(
             "failed to materialize logical tensor assembly inputs");
 
+      auto sourceValueType = cast<RankedTensorType>((*logicalSource).getType());
+      int64_t sourcePrefixRank =
+          sourceValueType.getRank() - static_cast<int64_t>(sourceType.getRank());
+      SmallVector<OpFoldResult> mixedOffsets(sourcePrefixRank,
+                                             rewriter.getIndexAttr(0));
+      SmallVector<OpFoldResult> mixedSizes;
+      SmallVector<OpFoldResult> mixedStrides(sourcePrefixRank,
+                                             rewriter.getIndexAttr(1));
+      for (int64_t i = 0; i < sourcePrefixRank; ++i)
+        mixedSizes.push_back(rewriter.getIndexAttr(sourceValueType.getShape()[i]));
+      llvm::append_range(mixedOffsets, insertSlice.getMixedOffsets());
+      llvm::append_range(mixedSizes, insertSlice.getMixedSizes());
+      llvm::append_range(mixedStrides, insertSlice.getMixedStrides());
+
       auto assembled = rewriter.create<tensor::InsertSliceOp>(
           insertSlice.getLoc(), *logicalSource, *logicalDest,
-          insertSlice.getMixedOffsets(), insertSlice.getMixedSizes(),
-          insertSlice.getMixedStrides());
+          mixedOffsets, mixedSizes, mixedStrides);
       auto tiledAssembled = builder.getTiledValue(assembled.getResult());
       if (failed(tiledAssembled))
         return insertSlice.emitOpError(

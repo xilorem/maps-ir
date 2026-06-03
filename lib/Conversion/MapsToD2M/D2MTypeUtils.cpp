@@ -27,11 +27,32 @@ mlir::tt::ttcore::MetalLayoutAttr getL1ShardedLayout(MLIRContext *ctx,
       mlir::tt::ttcore::TensorMemoryLayout::Sharded);
 }
 
+RankedTensorType getScalarDeviceTensorType(MLIRContext *ctx,
+                                           RankedTensorType type) {
+  auto layout = getL1ShardedLayout(ctx, type);
+  SmallVector<int64_t> unitGrid(layout.getPhysicalShape({}).size(), 1);
+  return RankedTensorType::get(layout.getDeviceShape(unitGrid, {}),
+                               type.getElementType(), layout);
+}
+
 RankedTensorType getTiledDeviceTensorType(MLIRContext *ctx,
                                           RankedTensorType type) {
-  if (type.getEncoding() &&
-      isa<mlir::tt::ttcore::TileType>(type.getElementType()))
-    return type;
+  if (type.getEncoding()) {
+    auto layout = cast<mlir::tt::ttcore::MetalLayoutAttr>(type.getEncoding());
+    if (isa<mlir::tt::ttcore::TileType>(type.getElementType()))
+      return type;
+
+    constexpr std::array<int64_t, 2> defaultTileShape =
+        mlir::tt::ttcore::TileType::getDefaultShape();
+    SmallVector<int64_t> tileShape(defaultTileShape.begin(),
+                                   defaultTileShape.end());
+    Type tileElementType =
+        mlir::tt::ttcore::TileType::get(type.getElementType(), tileShape);
+    SmallVector<int64_t> gridShape(layout.getGridShape(type).begin(),
+                                   layout.getGridShape(type).end());
+    return RankedTensorType::get(layout.getDeviceShape(gridShape, tileShape),
+                                 tileElementType, layout);
+  }
 
   auto layout = getL1ShardedLayout(ctx, type);
   constexpr std::array<int64_t, 2> defaultTileShape =
