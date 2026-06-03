@@ -43,29 +43,16 @@ public:
         tensor::ExtractSliceOp outputSlice,
         ComputeOpLoweringContext &ctx) const override {
     auto matmul = cast<linalg::MatmulOp>(value.getDefiningOp());
-    auto lhsSource = ctx.hoistValue(matmul.getInputs()[0]);
-    auto rhsSource = ctx.hoistValue(matmul.getInputs()[1]);
-    if (failed(lhsSource) || failed(rhsSource))
+    auto lhsType = cast<RankedTensorType>(matmul.getInputs()[0].getType());
+    auto rhsType = cast<RankedTensorType>(matmul.getInputs()[1].getType());
+    auto loweredLhs =
+        ctx.lowerValue(matmul.getInputs()[0], lhsType, tensor::ExtractSliceOp());
+    auto loweredRhs = ctx.lowerValue(matmul.getInputs()[1], rhsType, outputSlice);
+    if (failed(loweredLhs) || failed(loweredRhs) || !*loweredLhs || !*loweredRhs)
       return std::optional<Value>();
 
-    Value rhsValue = *rhsSource;
-    if (outputSlice) {
-      auto rhsType = cast<RankedTensorType>(rhsValue.getType());
-      SmallVector<int64_t> offsets(rhsType.getRank(), 0);
-      SmallVector<int64_t> sizes(rhsType.getShape().begin(),
-                                 rhsType.getShape().end());
-      offsets.back() = outputSlice.getStaticOffsets().back();
-      sizes.back() = outputSlice.getStaticSizes().back();
-      rhsValue = ctx.createStaticSlice(value.getLoc(), rhsValue, offsets, sizes);
-      rhsValue = ctx.materializeContiguous(value.getLoc(), rhsValue);
-    }
-
-    auto tiledLhs = ctx.builder.getTiledValue(*lhsSource);
-    auto tiledRhs = ctx.builder.getTiledValue(rhsValue);
-    if (failed(tiledLhs) || failed(tiledRhs))
-      return ctx.tile.emitOpError("failed to materialize tiled matmul inputs");
     auto matmulGeneric =
-        ctx.builder.createMatmulGeneric(value.getLoc(), *tiledLhs, *tiledRhs,
+        ctx.builder.createMatmulGeneric(value.getLoc(), **loweredLhs, **loweredRhs,
                                         outputType);
     if (failed(matmulGeneric))
       return failure();
@@ -121,18 +108,15 @@ public:
     }
 
     if (!concat) {
-      auto lhsValue = ctx.hoistValue(add.getLhs());
-      auto rhsValue = ctx.hoistValue(add.getRhs());
-      if (failed(lhsValue) || failed(rhsValue))
+      auto lhsType = cast<RankedTensorType>(add.getLhs().getType());
+      auto rhsType = cast<RankedTensorType>(add.getRhs().getType());
+      auto lhsValue = ctx.lowerValue(add.getLhs(), lhsType, tensor::ExtractSliceOp());
+      auto rhsValue = ctx.lowerValue(add.getRhs(), rhsType, tensor::ExtractSliceOp());
+      if (failed(lhsValue) || failed(rhsValue) || !*lhsValue || !*rhsValue)
         return std::optional<SmallVector<Value>>();
 
-      auto lhsSource = ctx.builder.getTiledValue(*lhsValue);
-      auto rhsSource = ctx.builder.getTiledValue(*rhsValue);
-      if (failed(lhsSource) || failed(rhsSource))
-        return ctx.tile.emitOpError("failed to materialize add inputs");
-
-      auto addGeneric = ctx.builder.createAddGeneric(add.getLoc(), *lhsSource,
-                                                     *rhsSource, outputType);
+      auto addGeneric = ctx.builder.createAddGeneric(add.getLoc(), **lhsValue,
+                                                     **rhsValue, outputType);
       if (failed(addGeneric))
         return failure();
       return std::optional<SmallVector<Value>>(
@@ -147,15 +131,12 @@ public:
       return std::optional<SmallVector<Value>>();
 
     for (Value concatInput : concat.getInputs()) {
-      auto concatInputValue = ctx.hoistValue(concatInput);
-      if (failed(concatInputValue))
+      auto logicalInputType = cast<RankedTensorType>(concatInput.getType());
+      auto concatInputValue =
+          ctx.lowerValue(concatInput, logicalInputType, tensor::ExtractSliceOp());
+      if (failed(concatInputValue) || !*concatInputValue)
         return std::optional<SmallVector<Value>>();
 
-      auto inputSource = ctx.builder.getTiledValue(*concatInputValue);
-      if (failed(inputSource))
-        return add.emitOpError("failed to materialize concat shard");
-
-      auto logicalInputType = cast<RankedTensorType>(concatInput.getType());
       SmallVector<int64_t> staticOffsets(logicalInputType.getRank(), 0);
       SmallVector<int64_t> staticSizes(logicalInputType.getShape().begin(),
                                        logicalInputType.getShape().end());
@@ -169,7 +150,7 @@ public:
       if (failed(tiledBias))
         return add.emitOpError("failed to materialize bias shard");
 
-      auto addGeneric = ctx.builder.createAddGeneric(add.getLoc(), *inputSource,
+      auto addGeneric = ctx.builder.createAddGeneric(add.getLoc(), **concatInputValue,
                                                      *tiledBias,
                                                      logicalInputType);
       if (failed(addGeneric))

@@ -2,6 +2,7 @@
 
 #include "maps/Conversion/MapsToD2M/ComputeOpRegistry.h"
 #include "maps/Conversion/MapsToD2M/D2MGenericBuilder.h"
+#include "maps/Conversion/MapsToD2M/D2MTypeUtils.h"
 #include "maps/Conversion/MapsToD2M/SpatialEmitter.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -12,6 +13,21 @@
 
 namespace mlir::maps {
 namespace {
+
+static bool isResidualComputeProducer(Value value) {
+  // check if the value is produced by an operation that we consider compute
+  Operation *definingOp = value.getDefiningOp();
+  if (!definingOp)
+    return false;
+
+  return isa<linalg::MatmulOp, linalg::GenericOp, math::ExpOp,
+             arith::AddFOp>(definingOp);
+}
+
+static bool isHoistableNonComputeOp(Operation *op) {
+  return isa<tensor::ExtractSliceOp, tensor::EmptyOp, tensor::InsertSliceOp,
+             tensor::ConcatOp, arith::ConstantOp>(op);
+}
 
 static Value createDirectStaticSlice(OpBuilder &builder, Location loc, Value value,
                                      ArrayRef<int64_t> offsets,
@@ -152,6 +168,12 @@ FailureOr<bool> lowerComputeTileProgram(
     Operation *definingOp = value.getDefiningOp();
     if (!definingOp || definingOp->getBlock() != &tile.getBody().front())
       return value;
+    if (!isHoistableNonComputeOp(definingOp)) {
+      definingOp->emitOpError(
+          "unsupported producer escaped D2M lowering; compute values must "
+          "lower through registered emitters instead of being hoisted");
+      return failure();
+    }
 
     IRMapping mapping;
     for (Value operand : definingOp->getOperands()) {
@@ -203,6 +225,22 @@ FailureOr<bool> lowerComputeTileProgram(
       return tile.emitOpError("missing placement for compute tile");
     return wrapGenericInSpatial(generic, coreRangeIt->second, rewriter);
   };
+  auto materializeLogicalValue = [&](Location loc, Value value,
+                                     RankedTensorType logicalType)
+      -> FailureOr<Value> {
+    auto valueType = dyn_cast<RankedTensorType>(value.getType());
+    if (!valueType)
+      return failure();
+    if (!valueType.getEncoding())
+      return value;
+
+    auto logicalOutput = rewriter.create<mlir::tt::d2m::EmptyOp>(
+        loc, logicalType.getShape(), logicalType.getElementType(),
+        logicalType.getEncoding());
+    auto toLayout = rewriter.create<mlir::tt::d2m::ToLayoutOp>(
+        loc, value, logicalOutput.getResult());
+    return toLayout.getResult(0);
+  };
   using OptionalValue = std::optional<Value>;
   std::function<FailureOr<OptionalValue>(
       Value, RankedTensorType, tensor::ExtractSliceOp)> lowerValue;
@@ -236,6 +274,48 @@ FailureOr<bool> lowerComputeTileProgram(
       return OptionalValue(*tiledInput);
     }
 
+    if (auto empty = value.getDefiningOp<tensor::EmptyOp>()) {
+      auto logicalType = cast<RankedTensorType>(empty.getType());
+      auto tiledType = getTiledDeviceTensorType(rewriter.getContext(),
+                                                logicalType);
+      auto tiledEmpty = rewriter.create<mlir::tt::d2m::EmptyOp>(
+          empty.getLoc(), tiledType.getShape(), tiledType.getElementType(),
+          tiledType.getEncoding());
+      return OptionalValue(tiledEmpty.getResult());
+    }
+
+    if (auto insertSlice = value.getDefiningOp<tensor::InsertSliceOp>()) {
+      auto sourceType =
+          cast<RankedTensorType>(insertSlice.getSource().getType());
+      auto destType = cast<RankedTensorType>(insertSlice.getDest().getType());
+
+      auto loweredSource =
+          lowerValue(insertSlice.getSource(), sourceType, tensor::ExtractSliceOp());
+      auto loweredDest =
+          lowerValue(insertSlice.getDest(), destType, tensor::ExtractSliceOp());
+      if (failed(loweredSource) || failed(loweredDest) || !*loweredSource ||
+          !*loweredDest)
+        return OptionalValue();
+
+      auto logicalSource =
+          materializeLogicalValue(insertSlice.getLoc(), **loweredSource, sourceType);
+      auto logicalDest =
+          materializeLogicalValue(insertSlice.getLoc(), **loweredDest, destType);
+      if (failed(logicalSource) || failed(logicalDest))
+        return insertSlice.emitOpError(
+            "failed to materialize logical tensor assembly inputs");
+
+      auto assembled = rewriter.create<tensor::InsertSliceOp>(
+          insertSlice.getLoc(), *logicalSource, *logicalDest,
+          insertSlice.getMixedOffsets(), insertSlice.getMixedSizes(),
+          insertSlice.getMixedStrides());
+      auto tiledAssembled = builder.getTiledValue(assembled.getResult());
+      if (failed(tiledAssembled))
+        return insertSlice.emitOpError(
+            "failed to materialize tiled tensor assembly result");
+      return OptionalValue(*tiledAssembled);
+    }
+
     ComputeOpLoweringContext opCtx{
         .tile = tile,
         .builder = builder,
@@ -255,6 +335,12 @@ FailureOr<bool> lowerComputeTileProgram(
                                                   opCtx);
         succeeded(loweredOp)) {
       return loweredOp;
+    }
+    if (isResidualComputeProducer(value)) {
+      value.getDefiningOp()->emitOpError(
+          "unsupported compute producer for recursive D2M lowering; add a "
+          "registered compute emitter instead of falling back to tilization");
+      return failure();
     }
 
     auto sourceValue = hoistValue(value);
@@ -291,16 +377,20 @@ FailureOr<bool> lowerComputeTileProgram(
       }};
 
   for (maps::SendOp send : sends) {
-    auto hoistedSendValue = hoistValue(send.getValue());
-    if (failed(hoistedSendValue))
-      return success(false);
-    logicalChannelValues[send.getChannelAttr()] = *hoistedSendValue;
-
     auto outputType = cast<RankedTensorType>(send.getValue().getType());
     Value sendValue = send.getValue();
     auto sendSlice = sendValue.getDefiningOp<tensor::ExtractSliceOp>();
     if (sendSlice)
       sendValue = sendSlice.getSource();
+
+    std::optional<Value> hoistedSendValue;
+    if (!isResidualComputeProducer(sendValue)) {
+      auto hoistedValue = hoistValue(send.getValue());
+      if (failed(hoistedValue))
+        return success(false);
+      hoistedSendValue = *hoistedValue;
+      logicalChannelValues[send.getChannelAttr()] = *hoistedSendValue;
+    }
 
     rewriter.setInsertionPoint(tile);
     if (auto loweredValues =
@@ -320,6 +410,20 @@ FailureOr<bool> lowerComputeTileProgram(
       channelValues[send.getChannelAttr()] = wrappedValues.front();
       channelValueLists[send.getChannelAttr()] = wrappedValues;
     } else {
+      if (isResidualComputeProducer(sendValue)) { // if the residual value is produced by a compute op, fail
+        Operation *producer = sendValue.getDefiningOp();
+        return send.emitOpError()
+               << "unsupported compute producer '"
+               << producer->getName().getStringRef()
+               << "' for maps.send; add a registered compute/send emitter "
+                  "instead of falling back to tilization";
+      }
+
+      if (!hoistedSendValue) {
+        send.emitOpError("missing hoisted non-compute send value");
+        return failure();
+      }
+
       auto tiledValue = builder.getTiledValue(*hoistedSendValue);
       if (failed(tiledValue))
         return send.emitOpError("failed to materialize generic send value");
