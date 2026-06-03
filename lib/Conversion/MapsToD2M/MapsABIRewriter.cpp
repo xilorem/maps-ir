@@ -24,7 +24,7 @@ static BlockArgument getRootBlockArgument(Value value) {
 
 static void annotateForwardFunc(func::FuncOp func, MapsProgramInfo &program) {
   MLIRContext *ctx = func.getContext(); // get context before modifying the function to avoid invalidating it
-  func->setAttr("tt.function_type", StringAttr::get(ctx, "forward_device"));
+  func->setAttr("tt.function_type", StringAttr::get(ctx, "forward_device")); // tells tt this function is the function that will be called by the host to execute the forward pass on the device
   if (func.getSymName() == "main")
     func.setSymName("forward");
 

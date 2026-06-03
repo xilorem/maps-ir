@@ -18,22 +18,28 @@ static void inlineRegionOp(PatternRewriter &rewriter, Operation *op) {
 } // namespace
 
 
-// main entry point
+// op lowering entry point
 LogicalResult lowerMapsProgramToD2M(ModuleOp module,
                                     MapsProgramInfo &program,
                                     ChannelLoweringState &state) {
-  PatternRewriter rewriter(module.getContext()); //
+  PatternRewriter rewriter(module.getContext()); 
+
   DenseMap<Attribute, Value> logicalChannelValues;
-  DenseMap<Operation *, int64_t> tileStageIds;
-  DenseMap<Operation *, mlir::tt::ttcore::CoreRangeAttr> tileCoreRanges;
+  DenseMap<Operation *, int64_t> tileStageIds; // maps each tile operation to the stage it belongs to.
+  DenseMap<Operation *, mlir::tt::ttcore::CoreRangeAttr> tileCoreRanges; // maps each tile operation to the TT core range where it should run.
+  
+  // get a mapping from tile operations to stage ids
   for (StageInfo &stage : program.stages) {
     for (TileInfo &tile : stage.tiles)
       tileStageIds[tile.op.getOperation()] = stage.stageId;
   }
 
+  
   auto placement = analyzeMapsPlacement(program);
   if (failed(placement))
     return failure();
+
+  // maps compute tiles to their core ranges based on the placement analysis results
   for (const TilePlacementInfo &tilePlacement : placement->tilePlacements) {
     for (const TileProgramInfo *tileProgram : tilePlacement.tilePrograms) {
       if (!tileProgram->isInitStorage)
@@ -42,8 +48,8 @@ LogicalResult lowerMapsProgramToD2M(ModuleOp module,
     }
   }
 
-  // Inline the MAPS structural wrappers.
-  // setInsertionPoint sets the "cursor" of the patternRewriter to the specific op loc
+  // Inline (flatten) the MAPS structural wrappers.
+  // setInsertionPoint sets the "cursor" of the patternRewriter to the specific op location
   rewriter.setInsertionPoint(program.init); 
   inlineRegionOp(rewriter, program.init);
   rewriter.setInsertionPoint(program.run);
@@ -73,6 +79,7 @@ LogicalResult lowerMapsProgramToD2M(ModuleOp module,
     SmallVector<maps::TileOp> deferredTiles;
     bool madeProgress = false;
 
+    // entry point for compute tile lowering
     for (maps::TileOp tile : pendingTiles) {
       auto lowered = lowerComputeTileProgram(
           tile, program.channels, state.values, logicalChannelValues,
@@ -88,6 +95,7 @@ LogicalResult lowerMapsProgramToD2M(ModuleOp module,
       deferredTiles.push_back(tile);
     }
 
+    // fallback check to avoid infinite loop in case of cycles or unsupported dependencies
     if (!madeProgress)
       return deferredTiles.front().emitOpError(
           "failed to resolve compute tile dependencies");
