@@ -55,6 +55,17 @@ static bool foldIdentityMaterialization(tensor::InsertSliceOp insertSlice) {
   return true;
 }
 
+static bool hasNonDeadNestedOp(Operation *op) {
+  bool hasNonDeadNested = false;
+  op->walk([&](Operation *nested) {
+    if (nested == op)
+      return;
+    if (!isOpTriviallyDead(nested))
+      hasNonDeadNested = true;
+  });
+  return hasNonDeadNested;
+}
+
 } // namespace
 
 void cleanupGeneratedIR(ModuleOp module) {
@@ -77,7 +88,7 @@ void cleanupGeneratedIR(ModuleOp module) {
     module.walk([&](Operation *op) {
       if (isa<ModuleOp>(op))
         return;
-      if (isOpTriviallyDead(op)) {
+      if (isOpTriviallyDead(op) && !hasNonDeadNestedOp(op)) {
         deadOps.push_back(op);
       }
     });

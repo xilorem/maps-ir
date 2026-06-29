@@ -22,6 +22,7 @@ add_mlir_library(MLIRMapsToD2M
 
   LINK_LIBS PUBLIC
   MLIRMapsDialect
+  TTMLIR::MLIRTTTransforms
   TTMLIR::MLIRTTCoreDialect
   TTMLIR::MLIRD2MDialect
   TTMLIR::MLIRD2MUtils

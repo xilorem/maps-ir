@@ -45,9 +45,50 @@ public:
     auto matmul = cast<linalg::MatmulOp>(value.getDefiningOp());
     auto lhsType = cast<RankedTensorType>(matmul.getInputs()[0].getType());
     auto rhsType = cast<RankedTensorType>(matmul.getInputs()[1].getType());
-    auto loweredLhs =
-        ctx.lowerValue(matmul.getInputs()[0], lhsType, tensor::ExtractSliceOp());
-    auto loweredRhs = ctx.lowerValue(matmul.getInputs()[1], rhsType, outputSlice);
+    auto lowerTiledOperand =
+        [&](Value operand, RankedTensorType operandType, bool needsSlice,
+            ArrayRef<int64_t> offsets, ArrayRef<int64_t> sizes)
+        -> FailureOr<std::optional<Value>> {
+      if (!needsSlice)
+        return ctx.lowerValue(operand, operandType, tensor::ExtractSliceOp());
+
+      auto source = ctx.getSourceValue(operand);
+      if (failed(source))
+        return std::optional<Value>();
+      Value slice =
+          ctx.createStaticSlice(matmul.getLoc(), *source, offsets, sizes);
+      slice = ctx.materializeContiguous(matmul.getLoc(), slice);
+      auto tiledSlice = ctx.builder.getTiledValue(slice);
+      if (failed(tiledSlice))
+        return matmul.emitOpError("failed to materialize sliced matmul input");
+      return std::optional<Value>(*tiledSlice);
+    };
+
+    SmallVector<int64_t> lhsOffsets(lhsType.getRank(), 0);
+    SmallVector<int64_t> lhsSizes(lhsType.getShape().begin(),
+                                  lhsType.getShape().end());
+    SmallVector<int64_t> rhsOffsets(rhsType.getRank(), 0);
+    SmallVector<int64_t> rhsSizes(rhsType.getShape().begin(),
+                                  rhsType.getShape().end());
+    bool sliceLhs = false;
+    bool sliceRhs = false;
+    if (outputSlice) {
+      if (lhsType.getRank() != 2 || rhsType.getRank() != 2)
+        return matmul.emitOpError("sliced matmul lowering expects rank-2 inputs");
+      auto outputOffsets = outputSlice.getStaticOffsets();
+      auto outputSizes = outputSlice.getStaticSizes();
+      lhsOffsets[0] = outputOffsets[0];
+      lhsSizes[0] = outputSizes[0];
+      rhsOffsets[1] = outputOffsets[1];
+      rhsSizes[1] = outputSizes[1];
+      sliceLhs = lhsOffsets[0] != 0 || lhsSizes[0] != lhsType.getDimSize(0);
+      sliceRhs = rhsOffsets[1] != 0 || rhsSizes[1] != rhsType.getDimSize(1);
+    }
+
+    auto loweredLhs = lowerTiledOperand(matmul.getInputs()[0], lhsType, sliceLhs,
+                                        lhsOffsets, lhsSizes);
+    auto loweredRhs = lowerTiledOperand(matmul.getInputs()[1], rhsType, sliceRhs,
+                                        rhsOffsets, rhsSizes);
     if (failed(loweredLhs) || failed(loweredRhs) || !*loweredLhs || !*loweredRhs)
       return std::optional<Value>();
 
@@ -73,9 +114,20 @@ public:
     auto generic = cast<linalg::GenericOp>(value.getDefiningOp());
     SmallVector<Value> loweredInputs;
     loweredInputs.reserve(generic.getNumDpsInputs());
-    for (Value input : generic.getDpsInputs()) {
-      auto loweredInput = ctx.lowerValue(
-          input, cast<RankedTensorType>(input.getType()), tensor::ExtractSliceOp());
+    auto genericOutputType =
+        cast<RankedTensorType>(generic.getDpsInits()[0].getType());
+    auto identityMap = AffineMap::getMultiDimIdentityMap(
+        genericOutputType.getRank(), generic.getContext());
+    auto indexingMaps = generic.getIndexingMapsArray();
+    for (auto [inputIndex, input] : llvm::enumerate(generic.getDpsInputs())) {
+      auto inputType = cast<RankedTensorType>(input.getType());
+      tensor::ExtractSliceOp inputSlice;
+      if (outputSlice && inputType.getShape() == genericOutputType.getShape() &&
+          indexingMaps[inputIndex] == identityMap) {
+        inputSlice = outputSlice;
+      }
+
+      auto loweredInput = ctx.lowerValue(input, inputType, inputSlice);
       if (failed(loweredInput) || !*loweredInput)
         return loweredInput;
       loweredInputs.push_back(**loweredInput);

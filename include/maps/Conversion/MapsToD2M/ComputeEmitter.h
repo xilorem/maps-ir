@@ -10,6 +10,7 @@ namespace mlir::maps {
 struct ChannelLoweringState {
   DenseMap<Attribute, Value> values;
   DenseMap<Attribute, SmallVector<Value>> valueLists;
+  DenseMap<Attribute, Value> semaphores;
   DenseMap<int64_t, SmallVector<Attribute>> stageChannels;
 };
 
@@ -18,8 +19,10 @@ FailureOr<bool> lowerComputeTileProgram(
     DenseMap<Attribute, Value> &channelValues,
     DenseMap<Attribute, Value> &logicalChannelValues,
     DenseMap<Attribute, SmallVector<Value>> &channelValueLists,
+    DenseMap<Attribute, Value> &channelSemaphores,
     DenseMap<Attribute, Value> &slotValues,
     DenseMap<Operation *, mlir::tt::ttcore::CoreRangeAttr> &tileCoreRanges,
+    DenseMap<int64_t, mlir::tt::ttcore::CoreRangeAttr> &tileIdCoreRanges,
     DenseMap<int64_t, SmallVector<Attribute>> &stageChannels,
     DenseMap<Operation *, int64_t> &tileStageIds, PatternRewriter &rewriter);
 

@@ -5,6 +5,7 @@
 #include "maps/Conversion/MapsToD2M/MapsCleanup.h"
 #include "maps/Conversion/MapsToD2M/MapsPatternLowering.h"
 #include "maps/Conversion/MapsToD2M/MapsProgramAnalysis.h"
+#include "ttmlir/Dialect/TTCore/Transforms/Transforms.h"
 
 namespace mlir::maps {
 #define GEN_PASS_DEF_CONVERTMAPSTOD2M
@@ -29,6 +30,8 @@ struct ConvertMapsToD2MPass
     // Rewrite the forward ABI before lowering.
     if (failed(rewriteForwardABI(module, *program)))
       return signalPassFailure();
+
+    tt::ttcore::registerDevice(module);
 
     // Lower MAPS ops to D2M.
     ChannelLoweringState channels;

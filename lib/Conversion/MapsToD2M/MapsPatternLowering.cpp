@@ -27,6 +27,7 @@ LogicalResult lowerMapsProgramToD2M(ModuleOp module,
   DenseMap<Attribute, Value> logicalChannelValues;
   DenseMap<Operation *, int64_t> tileStageIds; // maps each tile operation to the stage it belongs to.
   DenseMap<Operation *, mlir::tt::ttcore::CoreRangeAttr> tileCoreRanges; // maps each tile operation to the TT core range where it should run.
+  DenseMap<int64_t, mlir::tt::ttcore::CoreRangeAttr> tileIdCoreRanges;
   
   // get a mapping from tile operations to stage ids
   for (StageInfo &stage : program.stages) {
@@ -46,6 +47,7 @@ LogicalResult lowerMapsProgramToD2M(ModuleOp module,
         tileCoreRanges[const_cast<maps::TileOp &>(tileProgram->op).getOperation()] =
             tilePlacement.coreRange;
     }
+    tileIdCoreRanges[tilePlacement.tileId] = tilePlacement.coreRange;
   }
 
   // Inline (flatten) the MAPS structural wrappers.
@@ -83,7 +85,8 @@ LogicalResult lowerMapsProgramToD2M(ModuleOp module,
     for (maps::TileOp tile : pendingTiles) {
       auto lowered = lowerComputeTileProgram(
           tile, program.channels, state.values, logicalChannelValues,
-          state.valueLists, program.slotValues, tileCoreRanges,
+          state.valueLists, state.semaphores, program.slotValues, tileCoreRanges,
+          tileIdCoreRanges,
           state.stageChannels,
           tileStageIds, rewriter);
       if (failed(lowered))

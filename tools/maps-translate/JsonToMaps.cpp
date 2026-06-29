@@ -68,6 +68,9 @@ struct Stage {
     int64_t y0;
     int64_t width;
     int64_t height;
+    bool hasExplicitTileIds;
+    llvm::DenseSet<int64_t> tileIds;
+    llvm::DenseMap<int64_t, int64_t> physicalToVirtualTileId;
 };
 
 
@@ -239,6 +242,37 @@ static Value emitElementwiseExp(Location loc, Value input,
                    Value exp = math::ExpOp::create(
                        nestedBuilder, nestedLoc, blockArgs[0]);
                    linalg::YieldOp::create(nestedBuilder, nestedLoc, exp);
+               })
+        .getResult(0);
+}
+
+static Value emitElementwiseLog(Location loc, Value input,
+                                RankedTensorType outputType,
+                                OpBuilder &builder) {
+    Value init = tensor::EmptyOp::create(
+        builder, loc, outputType.getShape(),
+        outputType.getElementType()).getResult();
+    auto identityMap =
+        AffineMap::getMultiDimIdentityMap(outputType.getRank(), builder.getContext());
+    SmallVector<AffineMap> indexingMaps = {
+        identityMap,
+        identityMap,
+    };
+    SmallVector<utils::IteratorType> iteratorTypes(
+        outputType.getRank(), utils::IteratorType::parallel);
+    return linalg::GenericOp::create(
+               builder,
+               loc,
+               outputType,
+               ValueRange{input},
+               ValueRange{init},
+               indexingMaps,
+               iteratorTypes,
+               [&](OpBuilder &nestedBuilder, Location nestedLoc,
+                   ValueRange blockArgs) {
+                   Value log = math::LogOp::create(
+                       nestedBuilder, nestedLoc, blockArgs[0]);
+                   linalg::YieldOp::create(nestedBuilder, nestedLoc, log);
                })
         .getResult(0);
 }
@@ -529,6 +563,9 @@ static FailureOr<Value> emitTransformAsStandardOps(
 
 
 static bool isTileInStage(const Tile &tile, const Stage &stage) {
+    if (stage.hasExplicitTileIds)
+        return stage.tileIds.contains(tile.hartId);
+
     return tile.x >= stage.x0 &&
            tile.x < stage.x0 + stage.width &&
            tile.y >= stage.y0 &&
@@ -600,7 +637,7 @@ static RankedTensorType parseTensorType(const llvm::json::Object &tensor,
 static std::optional<RankedTensorType>
 parseTileOutputType(const llvm::json::Object &tensor,
                     const llvm::json::Object &output, const Tile &tile,
-                    Type elementType) {
+                    const Stage &stage, Type elementType) {
     auto *dimsJson = tensor.getArray("dims");
     auto *layout = output.getObject("layout");
     auto *submesh = layout ? layout->getObject("submesh") : nullptr;
@@ -609,20 +646,41 @@ parseTileOutputType(const llvm::json::Object &tensor,
     if (!dimsJson || !layout || !submesh || !meshX || !meshY)
         return std::nullopt;
 
-    auto x0 = submesh->getInteger("x0");
-    auto y0 = submesh->getInteger("y0");
-    auto width = submesh->getInteger("width");
     auto logicalWidth = layout->getInteger("logical_width");
     auto logicalHeight = layout->getInteger("logical_height");
-    if (!x0 || !y0 || !width || !logicalWidth || !logicalHeight ||
+    if (!logicalWidth || !logicalHeight ||
         *logicalWidth <= 0 || *logicalHeight <= 0)
         return std::nullopt;
 
-    int64_t ordinal = (tile.y - *y0) * *width + tile.x - *x0;
-    int64_t logicalX = ordinal % *logicalWidth;
-    int64_t logicalY = ordinal / *logicalWidth;
-    if (ordinal < 0 || logicalY >= *logicalHeight)
+    std::optional<int64_t> ordinal;
+    auto x0 = submesh->getInteger("x0");
+    auto y0 = submesh->getInteger("y0");
+    auto width = submesh->getInteger("width");
+    if (x0 && y0 && width) {
+        ordinal = (tile.y - *y0) * *width + tile.x - *x0;
+    } else if (auto *tileIds = submesh->getArray("tile_ids")) {
+        int64_t layoutTileId = tile.hartId;
+        auto virtualTileIt = stage.physicalToVirtualTileId.find(tile.hartId);
+        if (virtualTileIt != stage.physicalToVirtualTileId.end())
+            layoutTileId = virtualTileIt->second;
+
+        for (auto indexed : llvm::enumerate(*tileIds)) {
+            auto tileId = indexed.value().getAsInteger();
+            if (!tileId)
+                return std::nullopt;
+            if (*tileId == layoutTileId) {
+                ordinal = static_cast<int64_t>(indexed.index());
+                break;
+            }
+        }
+    }
+    if (!ordinal)
         return std::nullopt;
+
+    if (*ordinal < 0 || *ordinal >= *logicalWidth * *logicalHeight)
+        return std::nullopt;
+    int64_t logicalX = *ordinal % *logicalWidth;
+    int64_t logicalY = *ordinal / *logicalWidth;
 
     SmallVector<int64_t> dims;
     for (const llvm::json::Value &dimValue : *dimsJson) {
@@ -868,18 +926,62 @@ static std::optional<SmallVector<Stage>>getStageObjs(const llvm::json::Array &st
 
         std::string symName = ("stage" + std::to_string(indexed.index()));
         auto *submesh = stage->getObject("submesh");
-        auto x0 = submesh->getInteger("x0");
-        auto y0 = submesh->getInteger("y0");
-        auto width = submesh->getInteger("width");
-        auto height = submesh->getInteger("height");
+        if (!submesh)
+            return std::nullopt;
+
+        llvm::DenseSet<int64_t> tileIds;
+        llvm::DenseMap<int64_t, int64_t> physicalToVirtualTileId;
+
+        auto *virtualToPhysical = stage->getObject("virtual_to_physical");
+        if (virtualToPhysical) {
+            for (const auto &entry : *virtualToPhysical) {
+                int64_t virtualTileId;
+                StringRef virtualTileIdString = entry.first;
+                if (virtualTileIdString.getAsInteger(10, virtualTileId))
+                    return std::nullopt;
+                auto physicalTileId = entry.second.getAsInteger();
+                if (!physicalTileId)
+                    return std::nullopt;
+                tileIds.insert(*physicalTileId);
+                physicalToVirtualTileId[*physicalTileId] = virtualTileId;
+            }
+        } else if (auto *submeshTileIds = submesh->getArray("tile_ids")) {
+            for (const llvm::json::Value &tileIdValue : *submeshTileIds) {
+                auto tileId = tileIdValue.getAsInteger();
+                if (!tileId)
+                    return std::nullopt;
+                tileIds.insert(*tileId);
+            }
+        }
+
+        bool hasExplicitTileIds = !tileIds.empty();
+        int64_t x0Value = 0;
+        int64_t y0Value = 0;
+        int64_t widthValue = 0;
+        int64_t heightValue = 0;
+        if (!hasExplicitTileIds) {
+            auto x0 = submesh->getInteger("x0");
+            auto y0 = submesh->getInteger("y0");
+            auto width = submesh->getInteger("width");
+            auto height = submesh->getInteger("height");
+            if (!x0 || !y0 || !width || !height)
+                return std::nullopt;
+            x0Value = *x0;
+            y0Value = *y0;
+            widthValue = *width;
+            heightValue = *height;
+        }
 
         result.push_back(Stage{
             static_cast<int64_t>(indexed.index()),
             symName,
-            *x0,
-            *y0,
-            *width,
-            *height,
+            x0Value,
+            y0Value,
+            widthValue,
+            heightValue,
+            hasExplicitTileIds,
+            std::move(tileIds),
+            std::move(physicalToVirtualTileId),
         });
     }
 
@@ -1443,7 +1545,8 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
                         cast<RankedTensorType>(inputValues.front().getType())
                             .getElementType();
                     auto outputType =
-                        parseTileOutputType(*nodeOutput, *output, tileObj, elementType);
+                        parseTileOutputType(
+                            *nodeOutput, *output, tileObj, stageObj, elementType);
                     if (!outputType) {
                         llvm::errs() << "unsupported transform MAPS node: invalid output "
                                         "layout\n";
@@ -1479,26 +1582,33 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
                     return {};
                 }
 
-                if (*opName == "Exp") {
+                if (*opName == "Exp" || *opName == "Log") {
                     auto inputTensorId = getTensorId((*inputs)[0]);
                     if (!inputTensorId) {
-                        llvm::errs() << "unsupported Exp node: missing tensor id\n";
+                        llvm::errs() << "unsupported " << *opName
+                                     << " node: missing tensor id\n";
                         return {};
                     }
 
                     Value inputValue = tileValues.lookup(*inputTensorId);
                     if (!inputValue) {
-                        llvm::errs() << "unsupported Exp node: missing local input value\n";
+                        llvm::errs() << "unsupported " << *opName
+                                     << " node: missing local input value\n";
                         return {};
                     }
 
                     auto inputType = dyn_cast<RankedTensorType>(inputValue.getType());
                     if (!inputType) {
-                        llvm::errs() << "unsupported Exp node: expected ranked tensor input\n";
+                        llvm::errs() << "unsupported " << *opName
+                                     << " node: expected ranked tensor input\n";
                         return {};
                     }
-                    Value exp = emitElementwiseExp(loc, inputValue, inputType, builder);
-                    tileValues[*outputTensorId] = exp;
+                    Value result = *opName == "Exp"
+                                       ? emitElementwiseExp(
+                                             loc, inputValue, inputType, builder)
+                                       : emitElementwiseLog(
+                                             loc, inputValue, inputType, builder);
+                    tileValues[*outputTensorId] = result;
                     continue;
                 }
 
@@ -1533,7 +1643,8 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
                         return {};
                     }
                     auto outputType = parseTileOutputType(
-                        *nodeOutput, *output, tileObj, lhsType.getElementType());
+                        *nodeOutput, *output, tileObj, stageObj,
+                        lhsType.getElementType());
                     if (!outputType) {
                         llvm::errs() << "unsupported Add node: invalid output layout\n";
                         return {};

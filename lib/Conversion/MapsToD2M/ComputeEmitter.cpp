@@ -8,6 +8,8 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "llvm/ADT/DenseSet.h"
+#include "ttmlir/Dialect/D2M/IR/D2MGenericRegionOps.h"
 
 #include <functional>
 
@@ -81,6 +83,214 @@ static void eraseBlockOps(PatternRewriter &rewriter, Block &body) {
     nested->dropAllDefinedValueUses();
     rewriter.eraseOp(nested);
   }
+}
+
+static bool isTileToTileChannel(const ChannelInfo &channel) {
+  return channel.srcHartId != -1 && channel.dstHartId != -1;
+}
+
+static RankedTensorType getGlobalSemaphoreBackingType(Operation *op) {
+  MLIRContext *ctx = op->getContext();
+  SmallVector<int64_t> gridShape = {8, 8};
+  SmallVector<int64_t> shardShape = {1, 1};
+  SmallVector<int64_t> dimAlignments = {1, 1};
+  auto i64Type = IntegerType::get(ctx, 64);
+  auto intervalsType = RankedTensorType::get({2, 2}, i64Type);
+  auto collapsedIntervals =
+      DenseIntElementsAttr::get(intervalsType, ArrayRef<int64_t>{0, 1, 1, 2});
+  auto layout = mlir::tt::ttcore::MetalLayoutAttr::get(
+      ctx, gridShape, mlir::tt::ttcore::OOBVal::Undef,
+      mlir::tt::ttcore::MemorySpace::DeviceL1,
+      mlir::tt::ttcore::TensorMemoryLayout::Sharded, collapsedIntervals,
+      dimAlignments);
+  auto elementType = IntegerType::get(ctx, 32,
+                                      IntegerType::SignednessSemantics::Unsigned);
+  return RankedTensorType::get(layout.getDeviceShape(gridShape, shardShape),
+                               elementType, layout);
+}
+
+static Value getOrCreateChannelSemaphore(
+    maps::SendOp send, DenseMap<Attribute, ChannelInfo> &channels,
+    DenseMap<Attribute, Value> &channelSemaphores, PatternRewriter &rewriter) {
+  Attribute channel = send.getChannelAttr();
+  auto channelIt = channels.find(channel);
+  if (channelIt == channels.end() || !isTileToTileChannel(channelIt->second))
+    return {};
+
+  auto semIt = channelSemaphores.find(channel);
+  if (semIt != channelSemaphores.end())
+    return semIt->second;
+
+  rewriter.setInsertionPoint(send->getParentOp());
+  auto backingType = getGlobalSemaphoreBackingType(send.getOperation());
+  auto backing = rewriter.create<mlir::tt::d2m::EmptyOp>(
+      send.getLoc(), backingType.getShape(), backingType.getElementType(),
+      backingType.getEncoding());
+  auto semType = mlir::tt::d2m::GlobalSemaphoreType::get(rewriter.getContext());
+  auto initialValue = IntegerAttr::get(backingType.getElementType(), 0);
+  auto sem = rewriter.create<mlir::tt::d2m::CreateGlobalSemaphoreOp>(
+      send.getLoc(), semType, backing.getResult(), initialValue);
+  channelSemaphores[channel] = sem.getResult();
+  return sem.getResult();
+}
+
+struct RecvSemaphore {
+  Attribute channel;
+  Value semaphore;
+  Value anchor;
+};
+
+static SmallVector<RecvSemaphore> collectRecvSemaphores(
+    maps::TileOp tile, DenseMap<Attribute, ChannelInfo> &channels,
+    DenseMap<Attribute, Value> &channelSemaphores,
+    DenseMap<Attribute, Value> &channelValues) {
+  SmallVector<RecvSemaphore> semaphores;
+  DenseSet<Value> seen;
+
+  for (Operation &nested : tile.getBody().front()) {
+    auto recv = dyn_cast<maps::RecvOp>(nested);
+    if (!recv)
+      continue;
+
+    auto channelIt = channels.find(recv.getChannelAttr());
+    if (channelIt == channels.end() || !isTileToTileChannel(channelIt->second))
+      continue;
+
+    auto semIt = channelSemaphores.find(recv.getChannelAttr());
+    if (semIt == channelSemaphores.end())
+      continue;
+    auto anchorIt = channelValues.find(recv.getChannelAttr());
+    if (anchorIt == channelValues.end())
+      continue;
+    if (seen.insert(semIt->second).second)
+      semaphores.push_back({.channel = recv.getChannelAttr(),
+                            .semaphore = semIt->second,
+                            .anchor = anchorIt->second});
+  }
+
+  return semaphores;
+}
+
+static Value emitSemaphoreWaits(Location loc, ArrayRef<RecvSemaphore> semaphores,
+                                mlir::tt::ttcore::CoreRangeAttr coreRange,
+                                PatternRewriter &rewriter) {
+  if (semaphores.empty())
+    return {};
+
+  Value anchor = semaphores.front().anchor;
+  SmallVector<Value> semaphoreValues;
+  semaphoreValues.reserve(semaphores.size());
+  for (RecvSemaphore semaphore : semaphores)
+    semaphoreValues.push_back(semaphore.semaphore);
+
+  auto threads = rewriter.getArrayAttr(mlir::tt::d2m::ThreadAttr::get(
+      rewriter.getContext(), mlir::tt::d2m::ThreadType::Datamovement));
+  auto generic = rewriter.create<mlir::tt::d2m::GenericOp>(
+      loc, TypeRange{anchor.getType()}, ValueRange{}, ValueRange{anchor},
+      semaphoreValues, getFrontendGrid(rewriter.getContext()),
+      rewriter.getArrayAttr({}), rewriter.getAffineMapArrayAttr({}),
+      rewriter.getArrayAttr({}), threads,
+      /*fabricConnectionConfig=*/nullptr, /*regionsCount=*/1);
+
+  {
+    PatternRewriter::InsertionGuard guard(rewriter);
+    Region &region = generic.getRegion(0);
+    Block *block = rewriter.createBlock(&region);
+    rewriter.setInsertionPointToEnd(block);
+    Value one = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    for (RecvSemaphore semaphore : semaphores)
+      rewriter.create<mlir::tt::d2m::SemaphoreWaitOp>(
+          loc, semaphore.semaphore, one);
+    rewriter.create<mlir::tt::d2m::YieldOp>(loc, ValueRange{anchor});
+  }
+
+  rewriter.setInsertionPoint(generic);
+  auto spatial = rewriter.create<mlir::tt::d2m::SpatialOp>(
+      loc, TypeRange{anchor.getType()}, ValueRange{}, ValueRange{anchor},
+      rewriter.getArrayAttr(coreRange), /*regionsCount=*/1);
+  Block *regionBlock = rewriter.createBlock(&spatial.getRegions().front());
+  generic->moveBefore(regionBlock, regionBlock->end());
+  rewriter.setInsertionPointToEnd(regionBlock);
+  rewriter.create<mlir::tt::d2m::SpatialYieldOp>(
+      loc, TypeRange{}, generic.getResults(), ArrayRef<NamedAttribute>{});
+  rewriter.setInsertionPointAfter(spatial);
+  return spatial.getResult(0);
+}
+
+static FailureOr<Value> materializeTileToTilePayload(Location loc, Value source,
+                                                     PatternRewriter &rewriter) {
+  auto sourceType = dyn_cast<RankedTensorType>(source.getType());
+  if (!sourceType)
+    return failure();
+  auto sourceLayout =
+      dyn_cast_if_present<mlir::tt::ttcore::MetalLayoutAttr>(
+          sourceType.getEncoding());
+  if (!sourceLayout)
+    return failure();
+
+  auto dramLayout = mlir::tt::ttcore::MetalLayoutAttr::get(
+      rewriter.getContext(), sourceLayout.getLogicalShape(),
+      mlir::tt::ttcore::OOBVal::Undef,
+      mlir::tt::ttcore::MemorySpace::DeviceDRAM,
+      mlir::tt::ttcore::TensorMemoryLayout::Interleaved,
+      sourceLayout.getCollapsedIntervals(), sourceLayout.getDimAlignments());
+  SmallVector<int64_t> tileShape;
+  if (auto tileType =
+          dyn_cast<mlir::tt::ttcore::TileType>(sourceType.getElementType()))
+    llvm::append_range(tileShape, tileType.getShape());
+  SmallVector<int64_t> unitGrid = {1, 1};
+  auto dramType =
+      RankedTensorType::get(dramLayout.getDeviceShape(unitGrid, tileShape),
+                            sourceType.getElementType(), dramLayout);
+  auto dram = rewriter.create<mlir::tt::d2m::EmptyOp>(
+      loc, dramType.getShape(), dramType.getElementType(),
+      dramType.getEncoding());
+  auto toLayout = rewriter.create<mlir::tt::d2m::ToLayoutOp>(
+      loc, source, dram.getResult());
+  return toLayout.getResult(0);
+}
+
+static Value emitSemaphoreSignal(Location loc, Value semaphore, Value anchor,
+                                 mlir::tt::ttcore::CoreRangeAttr senderCoreRange,
+                                 mlir::tt::ttcore::CoreRangeAttr dstCoreRange,
+                                 PatternRewriter &rewriter) {
+  if (!semaphore || !anchor)
+    return {};
+
+  auto threads = rewriter.getArrayAttr(mlir::tt::d2m::ThreadAttr::get(
+      rewriter.getContext(), mlir::tt::d2m::ThreadType::Datamovement));
+  auto generic = rewriter.create<mlir::tt::d2m::GenericOp>(
+      loc, TypeRange{anchor.getType()}, ValueRange{}, ValueRange{anchor},
+      ValueRange{semaphore}, getFrontendGrid(rewriter.getContext()),
+      rewriter.getArrayAttr({}), rewriter.getAffineMapArrayAttr({}),
+      rewriter.getArrayAttr({}), threads,
+      /*fabricConnectionConfig=*/nullptr, /*regionsCount=*/1);
+
+  {
+    PatternRewriter::InsertionGuard guard(rewriter);
+    Region &region = generic.getRegion(0);
+    Block *block = rewriter.createBlock(&region);
+    rewriter.setInsertionPointToEnd(block);
+    Value one = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    auto dst = dstCoreRange.getStartCoord();
+    Value dstY = rewriter.create<arith::ConstantIndexOp>(loc, dst.getY());
+    Value dstX = rewriter.create<arith::ConstantIndexOp>(loc, dst.getX());
+    rewriter.create<mlir::tt::d2m::SemaphoreIncOp>(
+        loc, semaphore, one, ValueRange{dstY, dstX});
+    rewriter.create<mlir::tt::d2m::YieldOp>(loc, ValueRange{anchor});
+  }
+
+  rewriter.setInsertionPoint(generic);
+  auto spatial = rewriter.create<mlir::tt::d2m::SpatialOp>(
+      loc, TypeRange{anchor.getType()}, ValueRange{}, ValueRange{anchor},
+      rewriter.getArrayAttr(senderCoreRange), /*regionsCount=*/1);
+  Block *regionBlock = rewriter.createBlock(&spatial.getRegions().front());
+  generic->moveBefore(regionBlock, regionBlock->end());
+  rewriter.setInsertionPointToEnd(regionBlock);
+  rewriter.create<mlir::tt::d2m::SpatialYieldOp>(
+      loc, TypeRange{}, generic.getResults(), ArrayRef<NamedAttribute>{});
+  rewriter.setInsertionPointAfter(spatial);
+  return spatial.getResult(0);
 }
 
 struct CompositeAssemblyPiece {
@@ -188,8 +398,10 @@ FailureOr<bool> lowerComputeTileProgram(
     DenseMap<Attribute, Value> &channelValues,
     DenseMap<Attribute, Value> &logicalChannelValues,
     DenseMap<Attribute, SmallVector<Value>> &channelValueLists,
+    DenseMap<Attribute, Value> &channelSemaphores,
     DenseMap<Attribute, Value> &slotValues,
     DenseMap<Operation *, mlir::tt::ttcore::CoreRangeAttr> &tileCoreRanges,
+    DenseMap<int64_t, mlir::tt::ttcore::CoreRangeAttr> &tileIdCoreRanges,
     DenseMap<int64_t, SmallVector<Attribute>> &stageChannels,
     DenseMap<Operation *, int64_t> &tileStageIds, PatternRewriter &rewriter) {
 
@@ -291,6 +503,19 @@ FailureOr<bool> lowerComputeTileProgram(
   };
 
   D2MGenericBuilder builder(rewriter.getContext(), rewriter);
+  SmallVector<RecvSemaphore> recvSemaphores =
+      collectRecvSemaphores(tile, channels, channelSemaphores, channelValues);
+  if (!recvSemaphores.empty()) {
+    auto coreRangeIt = tileCoreRanges.find(tile.getOperation());
+    if (coreRangeIt == tileCoreRanges.end())
+      return tile.emitOpError("missing placement for compute tile");
+    rewriter.setInsertionPoint(tile);
+    Value waitedAnchor =
+        emitSemaphoreWaits(tile.getLoc(), recvSemaphores, coreRangeIt->second,
+                           rewriter);
+    if (waitedAnchor)
+      channelValues[recvSemaphores.front().channel] = waitedAnchor;
+  }
   auto getLoweredInputValue = [&](Value value) -> FailureOr<Value> {
     if (auto recv = value.getDefiningOp<maps::RecvOp>()) {
       auto channelIt = channels.find(recv.getChannelAttr());
@@ -545,6 +770,17 @@ FailureOr<bool> lowerComputeTileProgram(
     }
 
     rewriter.setInsertionPoint(tile);
+    Value sendSemaphore =
+        getOrCreateChannelSemaphore(send, channels, channelSemaphores, rewriter);
+    std::optional<mlir::tt::ttcore::CoreRangeAttr> dstCoreRange;
+    auto channelIt = channels.find(send.getChannelAttr());
+    if (channelIt != channels.end() && isTileToTileChannel(channelIt->second)) {
+      auto dstIt = tileIdCoreRanges.find(channelIt->second.dstHartId);
+      if (dstIt == tileIdCoreRanges.end())
+        return send.emitOpError("missing destination tile placement");
+      dstCoreRange = dstIt->second;
+    }
+
     if (auto loweredValues =
             lowerRegisteredSendValue(sendValue, outputType, sendSlice, opCtx);
         succeeded(loweredValues)) {
@@ -557,7 +793,28 @@ FailureOr<bool> lowerComputeTileProgram(
         auto wrappedValue = wrapIfPlaced(loweredValue);
         if (failed(wrappedValue))
           return failure();
-        wrappedValues.push_back(*wrappedValue);
+        Value channelValue = *wrappedValue;
+        if (sendSemaphore && dstCoreRange) {
+          auto srcCoreRangeIt = tileCoreRanges.find(tile.getOperation());
+          if (srcCoreRangeIt == tileCoreRanges.end())
+            return tile.emitOpError("missing placement for compute tile");
+          rewriter.setInsertionPointAfter(
+              wrappedValue->getDefiningOp());
+          auto tileToTilePayload =
+              materializeTileToTilePayload(send.getLoc(), *wrappedValue,
+                                           rewriter);
+          if (failed(tileToTilePayload))
+            return send.emitOpError(
+                "failed to materialize tile-to-tile payload");
+          Value signaledValue =
+              emitSemaphoreSignal(send.getLoc(), sendSemaphore,
+                                  *tileToTilePayload,
+                                  srcCoreRangeIt->second, *dstCoreRange,
+                                  rewriter);
+          if (signaledValue)
+            channelValue = signaledValue;
+        }
+        wrappedValues.push_back(channelValue);
       }
       channelValues[send.getChannelAttr()] = wrappedValues.front();
       channelValueLists[send.getChannelAttr()] = wrappedValues;

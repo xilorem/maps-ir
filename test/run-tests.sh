@@ -5,7 +5,13 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 build_dir="${repo_root}/build"
 maps_opt="${build_dir}/tools/maps-opt/maps-opt"
 filecheck="${FILECHECK:-/opt/ttmlir-toolchain/bin/FileCheck}"
-ttmlir_opt="${TTMLIR_OPT:-/home/ivan/repos/tt-mlir/build/bin/ttmlir-opt}"
+if [[ -n "${TTMLIR_OPT:-}" ]]; then
+  ttmlir_opt="${TTMLIR_OPT}"
+elif [[ -x "${repo_root}/../tt-mlir-upstream/build/bin/ttmlir-opt" ]]; then
+  ttmlir_opt="${repo_root}/../tt-mlir-upstream/build/bin/ttmlir-opt"
+else
+  ttmlir_opt="${repo_root}/../tt-mlir/build/bin/ttmlir-opt"
+fi
 
 cmake --build "${build_dir}" --target maps-opt -j2 >/dev/null
 

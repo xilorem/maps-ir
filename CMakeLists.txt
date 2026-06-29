@@ -1,18 +1,11 @@
 cmake_minimum_required(VERSION 3.20)
 project(maps-ir LANGUAGES CXX C)
 
-set (CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED YES)
 
-find_package(MLIR REQUIRED CONFIG
-  HINTS /opt/ttmlir-toolchain/lib/cmake/mlir
-)
-find_package(LLVM REQUIRED CONFIG
-  HINTS /opt/ttmlir-toolchain/lib/cmake/llvm
-)
-find_package(TTMLIR REQUIRED CONFIG
-  HINTS /home/ivan/repos/tt-mlir/install/lib/cmake/ttmlir
-)
+find_package(MLIR REQUIRED CONFIG)
+find_package(LLVM REQUIRED CONFIG)
 
 message(STATUS "Using MLIRConfig.cmake in: ${MLIR_DIR}")
 message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
