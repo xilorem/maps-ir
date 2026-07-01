@@ -20,6 +20,8 @@
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <utility>
+
 // Abstract data types
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
@@ -53,7 +55,12 @@ struct TransitionFragment {
     int64_t dstHartId;
     SmallVector<SliceDim> srcDims;
     SmallVector<SliceDim> dstDims;
+    SmallVector<SliceDim> srcParentDims;
+    SmallVector<SliceDim> dstParentDims;
+    bool hasRelativeSubSlices;
 };
+
+using TransitionFragmentVector = SmallVector<TransitionFragment, 0>;
 
 struct Tile{
     int64_t hartId;
@@ -752,19 +759,70 @@ static std::optional<llvm::SetVector<int64_t>> collectExtOutputTensorIds(const l
 }
 
 
-static std::optional<SmallVector<SliceDim>> parseSliceDims(const llvm::json::Object &slice) {
+static std::optional<SmallVector<SliceDim>> parseSliceDimArray(const llvm::json::Array &dims) {
     SmallVector<SliceDim> result;
-    // auto rank = slice.getInteger("rank");
-    auto *dims = slice.getArray("dims");
 
-    for (const llvm::json::Value &dimValue : *dims) {
+    for (const llvm::json::Value &dimValue : dims) {
         auto *dim = dimValue.getAsObject();
+        if (!dim)
+            return std::nullopt;
         auto start = dim->getInteger("start");
         auto length = dim->getInteger("length");
+        if (!start || !length)
+            return std::nullopt;
 
         result.push_back({*start, *length});
     }
     return result;
+}
+
+
+static std::optional<SmallVector<SliceDim>> parseSliceDims(const llvm::json::Object &slice) {
+    auto *dims = slice.getArray("dims");
+    if (!dims)
+        return std::nullopt;
+    return parseSliceDimArray(*dims);
+}
+
+
+static DenseI64ArrayAttr getSliceDimsAttr(OpBuilder &builder,
+                                          ArrayRef<SliceDim> dims) {
+    SmallVector<int64_t> flattened;
+    flattened.reserve(dims.size() * 2);
+    for (const SliceDim &dim : dims) {
+        flattened.push_back(dim.start);
+        flattened.push_back(dim.length);
+    }
+    return builder.getDenseI64ArrayAttr(flattened);
+}
+
+
+static void setTransitionSubSliceAttrs(Operation *op,
+                                       const TransitionFragment &fragment,
+                                       OpBuilder &builder) {
+    if (!fragment.hasRelativeSubSlices)
+        return;
+
+    op->setAttr("src_parent_slice", getSliceDimsAttr(builder, fragment.srcParentDims));
+    op->setAttr("src_subslice", getSliceDimsAttr(builder, fragment.srcDims));
+    op->setAttr("dst_parent_slice", getSliceDimsAttr(builder, fragment.dstParentDims));
+    op->setAttr("dst_subslice", getSliceDimsAttr(builder, fragment.dstDims));
+}
+
+
+static std::optional<std::pair<SmallVector<SliceDim>, SmallVector<SliceDim>>>
+parseTensorSubSlice(const llvm::json::Object &subslice) {
+    auto *parent = subslice.getObject("parent");
+    auto *dims = subslice.getArray("dims");
+    if (!parent || !dims)
+        return std::nullopt;
+
+    auto parentDims = parseSliceDims(*parent);
+    auto relativeDims = parseSliceDimArray(*dims);
+    if (!parentDims || !relativeDims)
+        return std::nullopt;
+
+    return std::make_pair(*parentDims, *relativeDims);
 }
 
 
@@ -814,8 +872,8 @@ static std::optional<SmallVector<Fragment>> getInitFragments(const llvm::json::A
 }
 
 
-static std::optional<SmallVector<TransitionFragment>> getTransitionFragments(const llvm::json::Array &transitions) {
-    SmallVector<TransitionFragment> result;
+static std::optional<TransitionFragmentVector> getTransitionFragments(const llvm::json::Array &transitions) {
+    TransitionFragmentVector result;
     
     for (const llvm::json::Value &transitionValue : transitions) {
         auto *transition = transitionValue.getAsObject();
@@ -833,30 +891,66 @@ static std::optional<SmallVector<TransitionFragment>> getTransitionFragments(con
             
             auto srcHartId = fragment->getInteger("src_hartid");
             auto dstHartId = fragment->getInteger("dst_hartid");
-            auto *srcSlice = fragment->getObject("src_slice");
-            auto *dstSlice = fragment->getObject("dst_slice");
             auto fragName = (name->str() + "_from_tile" + std::to_string(*srcHartId) +
                              "_to_tile" + std::to_string(*dstHartId));
 
-            auto srcDims = parseSliceDims(*srcSlice);
-            auto dstDims = parseSliceDims(*dstSlice);
+            SmallVector<SliceDim> srcDims;
+            SmallVector<SliceDim> dstDims;
+            SmallVector<SliceDim> srcParentDims;
+            SmallVector<SliceDim> dstParentDims;
+            bool hasRelativeSubSlices = false;
+
+            if (auto *srcSubSlice = fragment->getObject("src_subslice")) {
+                auto *dstSubSlice = fragment->getObject("dst_subslice");
+                if (!dstSubSlice)
+                    return std::nullopt;
+
+                auto parsedSrc = parseTensorSubSlice(*srcSubSlice);
+                auto parsedDst = parseTensorSubSlice(*dstSubSlice);
+                if (!parsedSrc || !parsedDst)
+                    return std::nullopt;
+
+                srcParentDims = parsedSrc->first;
+                srcDims = parsedSrc->second;
+                dstParentDims = parsedDst->first;
+                dstDims = parsedDst->second;
+                hasRelativeSubSlices = true;
+            } else {
+                auto *srcSlice = fragment->getObject("src_slice");
+                auto *dstSlice = fragment->getObject("dst_slice");
+                if (!srcSlice || !dstSlice)
+                    return std::nullopt;
+
+                auto parsedSrcDims = parseSliceDims(*srcSlice);
+                auto parsedDstDims = parseSliceDims(*dstSlice);
+                if (!parsedSrcDims || !parsedDstDims)
+                    return std::nullopt;
+
+                srcDims = *parsedSrcDims;
+                dstDims = *parsedDstDims;
+                srcParentDims = srcDims;
+                dstParentDims = dstDims;
+            }
 
             result.push_back(TransitionFragment{
                 fragName,
                 *tensorId,
                 *srcHartId,
                 *dstHartId,
-                *srcDims,
-                *dstDims,
+                srcDims,
+                dstDims,
+                srcParentDims,
+                dstParentDims,
+                hasRelativeSubSlices,
             });
         }
     }
     return result;
 }
 
-static std::optional<SmallVector<TransitionFragment>> getFinalizationFragments(
+static std::optional<TransitionFragmentVector> getFinalizationFragments(
     const llvm::json::Array &finalizations) {
-    SmallVector<TransitionFragment> result;
+    TransitionFragmentVector result;
 
     for (const llvm::json::Value &finalizationValue : finalizations) {
         auto *finalization = finalizationValue.getAsObject();
@@ -889,6 +983,9 @@ static std::optional<SmallVector<TransitionFragment>> getFinalizationFragments(
                 *dstHartId,
                 *srcDims,
                 *dstDims,
+                *srcDims,
+                *dstDims,
+                false,
             });
         }
     }
@@ -1314,14 +1411,16 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
                 Type elementType = parseElementType(*tensor, builder);
                 Type resultType = RankedTensorType::get(shape, elementType);
 
-                Value transitionInput = maps::RecvOp::create(
+                auto recv = maps::RecvOp::create(
                     builder,
                     loc,
                     resultType,
                     StringRef(fragment.name),
                     fragment.srcHartId,
                     fragment.dstHartId
-                ).getResult();
+                );
+                setTransitionSubSliceAttrs(recv.getOperation(), fragment, builder);
+                Value transitionInput = recv.getResult();
                 transitionValues[fragment.tensorId].push_back({&fragment, transitionInput});
             }
 
@@ -1332,7 +1431,7 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
                     continue;
                 }
 
-                SmallVector<TransitionFragment> fragments;
+                TransitionFragmentVector fragments;
                 fragments.reserve(values.size());
                 for (const auto &value : values) {
                     fragments.push_back(*value.first);
@@ -1716,7 +1815,9 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
 
                 for (auto indexed : llvm::enumerate(fragment.srcDims)) {
                     const SliceDim &dim = indexed.value();
-                    int64_t localOffset = dim.start - localStarts[indexed.index()];
+                    int64_t localOffset = fragment.hasRelativeSubSlices
+                        ? dim.start
+                        : dim.start - localStarts[indexed.index()];
                     shape.push_back(dim.length);
                     offsets.push_back(builder.getIndexAttr(localOffset));
                     sizes.push_back(builder.getIndexAttr(dim.length));
@@ -1736,7 +1837,7 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
                     strides
                 );
 
-                maps::SendOp::create(
+                auto send = maps::SendOp::create(
                     builder,
                     loc,
                     slice,
@@ -1744,6 +1845,7 @@ static OwningOpRef<Operation *> importJsonToMaps(StringRef input,
                     builder.getI64IntegerAttr(fragment.srcHartId),
                     builder.getI64IntegerAttr(fragment.dstHartId)
                 );
+                setTransitionSubSliceAttrs(send.getOperation(), fragment, builder);
             }
 
             // send final output fragments back to L2
