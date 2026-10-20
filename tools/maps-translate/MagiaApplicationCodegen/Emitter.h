@@ -9,6 +9,7 @@ class raw_ostream;
 
 namespace mlir::maps {
 
+void planGatheredFifoLayouts(MagiaApplicationDescription &application);
 void emitApplicationHeader(const MagiaApplicationDescription &application,
                            llvm::raw_ostream &os);
 void emitApplicationDataSource(const MagiaApplicationDescription &application,

@@ -370,6 +370,7 @@ LogicalResult generateMagiaApplication(ModuleOp module,
     return failure();
   if (failed(configureRuntimeInputs(application)))
     return failure();
+  planGatheredFifoLayouts(application);
 
   StringRef sourceInitializers = magiaWeightsFile.empty()
                                      ? StringRef(application.weightsFile)

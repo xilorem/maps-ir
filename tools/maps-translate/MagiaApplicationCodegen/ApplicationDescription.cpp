@@ -186,73 +186,74 @@ getRequiredSpatzTasks(const MagiaApplicationDescription &application) {
   SmallVector<GeneratedSpatzTask> tasks;
   if (needsAdd)
     tasks.push_back({GeneratedOpKind::Add, "add_fp16_spatz_task",
-                     "add/spatz_task/add_fp16_spatz_task.c", "add/include",
+                     "add/fp16/spatz/spatz_task/add_fp16_spatz_task.c", "add/fp16/spatz/include",
                      "ADD_FP16_SPATZ_TASK", "add_fp16_task",
                      "MAPS_HAS_ADD_SPATZ_TASK"});
   if (needsMul)
     tasks.push_back({GeneratedOpKind::Mul, "mul_bcast_fp16_spatz_task",
-                     "mul/spatz_task/mul_bcast_fp16_spatz_task.c", "mul/include",
+                     "mul/fp16/spatz/spatz_task/mul_bcast_fp16_spatz_task.c", "mul/fp16/spatz/include",
                      "MUL_BCAST_FP16_SPATZ_TASK", "mul_bcast_fp16_task",
                      "MAPS_HAS_MUL_SPATZ_TASK"});
   if (needsMatmul)
-    tasks.push_back({GeneratedOpKind::Matmul, "matmul_fp16_spatz_task",
-                     "matmul/spatz_task/matmul_fp16_spatz_task.c", "matmul/include",
-                     "MATMUL_FP16_SPATZ_TASK", "matmul_fp16_task",
+    tasks.push_back({GeneratedOpKind::Matmul, "matmul_rows_fp16_spatz_task",
+                     "matmul/fp16/spatz/spatz_task/matmul_rows_fp16_spatz_task.c", "matmul/fp16/spatz/include",
+                     "MATMUL_ROWS_FP16_SPATZ_TASK", "matmul_fp16_task",
                      "MAPS_HAS_MATMUL_SPATZ_TASK"});
   if (needsDepthwiseConv)
     tasks.push_back({GeneratedOpKind::DepthwiseConv, "depthwise_conv_fp16_spatz_task",
-                     "depthwise_conv/spatz_task/depthwise_conv_fp16_spatz_task.c", "depthwise_conv/include",
+                     "depthwise_conv/fp16/spatz/spatz_task/depthwise_conv_fp16_spatz_task.c",
+                     "depthwise_conv/fp16/spatz/include",
                      "DEPTHWISE_CONV_FP16_SPATZ_TASK", "depthwise_conv_fp16_task",
                      "MAPS_HAS_DEPTHWISE_CONV_SPATZ_TASK"});
   if (needsSigmoid)
     tasks.push_back({GeneratedOpKind::Sigmoid, "sigmoid_fp16_spatz_task",
-                     "sigmoid/spatz_task/sigmoid_fp16_spatz_task.c", "sigmoid/include",
+                     "sigmoid/fp16/spatz/spatz_task/sigmoid_fp16_spatz_task.c", "sigmoid/fp16/spatz/include",
                      "SIGMOID_FP16_SPATZ_TASK", "sigmoid_fp16_task",
                      "MAPS_HAS_SIGMOID_SPATZ_TASK"});
   if (needsRelu)
     tasks.push_back({GeneratedOpKind::Relu, "relu_fp16_spatz_task",
-                     "relu/spatz_task/relu_fp16_spatz_task.c", "relu/include",
+                     "relu/fp16/spatz/spatz_task/relu_fp16_spatz_task.c", "relu/fp16/spatz/include",
                      "RELU_FP16_SPATZ_TASK", "relu_fp16_task",
                      "MAPS_HAS_RELU_SPATZ_TASK"});
   if (needsSoftmaxExp)
     tasks.push_back({GeneratedOpKind::SoftmaxExp, "softmax_exp_fp16_spatz_task",
-                     "softmax_exp/spatz_task/softmax_exp_fp16_spatz_task.c",
-                     "softmax_exp/include", "SOFTMAX_EXP_FP16_SPATZ_TASK",
+                     "softmax_exp/fp16/spatz/spatz_task/softmax_exp_fp16_spatz_task.c",
+                     "softmax_exp/fp16/spatz/include", "SOFTMAX_EXP_FP16_SPATZ_TASK",
                      "softmax_exp_fp16_task", "MAPS_HAS_SOFTMAX_EXP_SPATZ_TASK"});
   if (needsGroupReduce)
     tasks.push_back({GeneratedOpKind::GroupReduce, "group_reduce_fp16_spatz_task",
-                     "group_reduce/spatz_task/group_reduce_fp16_spatz_task.c",
-                     "group_reduce/include", "GROUP_REDUCE_FP16_SPATZ_TASK",
+                     "group_reduce/fp16/spatz/spatz_task/group_reduce_fp16_spatz_task.c",
+                     "group_reduce/fp16/spatz/include", "GROUP_REDUCE_FP16_SPATZ_TASK",
                      "group_reduce_fp16_task", "MAPS_HAS_GROUP_REDUCE_SPATZ_TASK"});
   if (needsGroupCenteredReduce)
     tasks.push_back({GeneratedOpKind::GroupCenteredReduce,
                      "group_centered_reduce_fp16_spatz_task",
-                     "group_centered_reduce/spatz_task/group_centered_reduce_fp16_spatz_task.c",
-                     "group_centered_reduce/include",
+                     "group_centered_reduce/fp16/spatz/spatz_task/group_centered_reduce_fp16_spatz_task.c",
+                     "group_centered_reduce/fp16/spatz/include",
                      "GROUP_CENTERED_REDUCE_FP16_SPATZ_TASK",
                      "group_centered_reduce_fp16_task",
                      "MAPS_HAS_GROUP_CENTERED_REDUCE_SPATZ_TASK"});
   if (needsGroupNormalize)
     tasks.push_back({GeneratedOpKind::GroupNormalize,
                      "group_normalize_fp16_spatz_task",
-                     "group_normalize/spatz_task/group_normalize_fp16_spatz_task.c",
-                     "group_normalize/include", "GROUP_NORMALIZE_FP16_SPATZ_TASK",
+                     "group_normalize/fp16/spatz/spatz_task/group_normalize_fp16_spatz_task.c",
+                     "group_normalize/fp16/spatz/include", "GROUP_NORMALIZE_FP16_SPATZ_TASK",
                      "group_normalize_fp16_task",
                      "MAPS_HAS_GROUP_NORMALIZE_SPATZ_TASK"});
   if (needsReduceSum)
     tasks.push_back({GeneratedOpKind::ReduceSum, "reducesum_fp16_spatz_task",
-                     "reducesum/spatz_task/reducesum_fp16_spatz_task.c",
-                     "reducesum/include", "REDUCESUM_FP16_SPATZ_TASK",
+                     "reducesum/fp16/spatz/spatz_task/reducesum_fp16_spatz_task.c",
+                     "reducesum/fp16/spatz/include", "REDUCESUM_FP16_SPATZ_TASK",
                      "reducesum_fp16_task", "MAPS_HAS_REDUCE_SUM_SPATZ_TASK"});
   if (needsReduceMax)
     tasks.push_back({GeneratedOpKind::AllReduceMax, "reducemax_fp16_spatz_task",
-                     "reducemax/spatz_task/reducemax_fp16_spatz_task.c",
-                     "reducemax/include", "REDUCEMAX_FP16_SPATZ_TASK",
+                     "reducemax/fp16/spatz/spatz_task/reducemax_fp16_spatz_task.c",
+                     "reducemax/fp16/spatz/include", "REDUCEMAX_FP16_SPATZ_TASK",
                      "reducemax_fp16_task", "MAPS_HAS_REDUCE_MAX_SPATZ_TASK"});
   if (needsBinaryBcast)
     tasks.push_back({GeneratedOpKind::Sub, "binary_bcast_fp16_spatz_task",
-                     "binary_bcast/spatz_task/binary_bcast_fp16_spatz_task.c",
-                     "binary_bcast/include", "BINARY_BCAST_FP16_SPATZ_TASK",
+                     "binary_bcast/fp16/spatz/spatz_task/binary_bcast_fp16_spatz_task.c",
+                     "binary_bcast/fp16/spatz/include", "BINARY_BCAST_FP16_SPATZ_TASK",
                      "binary_bcast_fp16_task", "MAPS_HAS_BINARY_BCAST_SPATZ_TASK"});
   return tasks;
 }

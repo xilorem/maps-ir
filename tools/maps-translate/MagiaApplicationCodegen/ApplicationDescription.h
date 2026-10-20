@@ -209,6 +209,12 @@ struct GeneratedTilePlan {
   SmallVector<unsigned> sendIndices;
   SmallVector<unsigned> opIndices;
   SmallVector<unsigned> l2WriteIndices;
+  // magia-v3 FIFO gather layout, set by planGatheredFifoLayouts.  When any
+  // slice is gathered: per destination-local producer, the 1-based shared
+  // payload ring it gathers into, or 0 when its payloads stay in its own slots.
+  SmallVector<unsigned> fifoPayloadRings;
+  // Bytes per slot of each shared payload ring (the gathered slice's slot size).
+  SmallVector<uint64_t> fifoSharedRingBytes;
 };
 
 struct MagiaApplicationDescription {

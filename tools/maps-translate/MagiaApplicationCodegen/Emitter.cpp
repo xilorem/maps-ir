@@ -363,6 +363,162 @@ static void emitRecvDesc(const MagiaApplicationDescription &application,
   os << "  }";
 }
 
+// Decides which receives the magia-v3 runtime gathers in place: slices whose
+// receives tile them exactly, each on its own FIFO sub-ring, get a shared
+// payload ring that mirrors the slice's planned storage.  The receiver's FIFO
+// layout and every sender's payload mode are emitted from this one decision.
+//
+// The runtime registers each gathered slice in its slice alias table, indexed
+// by (slice id, token slot), and traps outside the default MAPS_ALIAS_MAX_SLICES
+// and MAPS_ALIAS_MAX_SLOTS of maps_utils.h; generated tiles assert these.
+static constexpr unsigned kRuntimeAliasMaxSlices = 64;
+static constexpr unsigned kRuntimeAliasMaxSlots = 4;
+
+static bool isSliceInplaceEligible(const MagiaApplicationDescription &application,
+                                   const GeneratedTilePlan &plan,
+                                   unsigned sliceIndex) {
+  auto readsSlice = [&](unsigned subsliceIndex) {
+    return application.subslices[subsliceIndex].sliceIndex == sliceIndex;
+  };
+  for (unsigned readIndex : plan.l2ReadIndices)
+    if (readsSlice(application.l2Reads[readIndex].dstSubsliceIndex))
+      return false;
+  for (unsigned sendIndex : plan.sendIndices)
+    if (readsSlice(application.sends[sendIndex].srcSubsliceIndex))
+      return false;
+  for (unsigned writeIndex : plan.l2WriteIndices)
+    if (readsSlice(application.l2Writes[writeIndex].srcSubsliceIndex))
+      return false;
+  for (unsigned opIndex : plan.opIndices) {
+    const GeneratedOp &op = application.ops[opIndex];
+    if (op.kind != GeneratedOpKind::AllReduceMax &&
+        op.kind != GeneratedOpKind::AllReduceSum && !op.isCollective)
+      continue;
+    if (llvm::any_of(op.inputSubsliceIndices, readsSlice) ||
+        llvm::any_of(op.outputSubsliceIndices, readsSlice))
+      return false;
+  }
+  return true;
+}
+
+static bool isRecvInplaceEligible(const MagiaApplicationDescription &application,
+                                  const GeneratedTilePlan &plan,
+                                  unsigned position) {
+  const GeneratedRecv &recv = application.recvs[plan.recvIndices[position]];
+  const GeneratedSubslice &dst = application.subslices[recv.dstSubsliceIndex];
+  const GeneratedSlice &slice = application.slices[dst.sliceIndex];
+  if (slice.globalKind == GeneratedGlobalKind::Initializer)
+    return false;
+  if (dst.shape.size() != slice.shape.size() || dst.shape.empty() ||
+      dst.elemBytes != slice.elemBytes)
+    return false;
+
+  uint64_t packedStride = dst.elemBytes;
+  for (unsigned d = dst.shape.size(); d-- > 0;) {
+    if (dst.offset[d] != 0 || dst.shape[d] != slice.shape[d] ||
+        dst.stridesBytes[d] != slice.stridesBytes[d] ||
+        slice.stridesBytes[d] != packedStride)
+      return false;
+    packedStride *= dst.shape[d];
+  }
+  for (unsigned i = 0; i < plan.recvIndices.size(); ++i)
+    if (i != position &&
+        application.subslices[application.recvs[plan.recvIndices[i]].dstSubsliceIndex]
+                .sliceIndex == dst.sliceIndex)
+      return false;
+  return isSliceInplaceEligible(application, plan, dst.sliceIndex);
+}
+
+static bool isSliceGatherEligible(const MagiaApplicationDescription &application,
+                                  const GeneratedTilePlan &plan,
+                                  unsigned sliceIndex) {
+  const GeneratedSlice &slice = application.slices[sliceIndex];
+  if (slice.globalKind == GeneratedGlobalKind::Initializer || slice.shape.empty() ||
+      slice.sliceId >= kRuntimeAliasMaxSlices ||
+      application.numTokenSlots > kRuntimeAliasMaxSlots ||
+      !isSliceInplaceEligible(application, plan, sliceIndex))
+    return false;
+
+  uint64_t covered = 0;
+  for (unsigned i = 0; i < plan.recvIndices.size(); ++i) {
+    const GeneratedSubslice &dst =
+        application.subslices[application.recvs[plan.recvIndices[i]].dstSubsliceIndex];
+    if (dst.sliceIndex != sliceIndex)
+      continue;
+    if (dst.shape.size() != slice.shape.size() || dst.elemBytes != slice.elemBytes)
+      return false;
+    for (unsigned d = 0; d < dst.shape.size(); ++d)
+      if (dst.stridesBytes[d] != slice.stridesBytes[d] ||
+          dst.offset[d] + dst.shape[d] > slice.shape[d])
+        return false;
+    for (unsigned j = 0; j < i; ++j) {
+      const GeneratedSubslice &other = application.subslices
+          [application.recvs[plan.recvIndices[j]].dstSubsliceIndex];
+      if (other.sliceIndex != sliceIndex)
+        continue;
+      bool overlap = true;
+      for (unsigned d = 0; d < dst.shape.size(); ++d)
+        if (other.offset[d] + other.shape[d] <= dst.offset[d] ||
+            dst.offset[d] + dst.shape[d] <= other.offset[d])
+          overlap = false;
+      if (overlap)
+        return false;
+    }
+    covered += product(dst.shape);
+  }
+  return covered != 0 && covered == product(slice.shape);
+}
+
+static void planGatheredFifoLayout(const MagiaApplicationDescription &application,
+                                   GeneratedTilePlan &plan) {
+  SmallVector<unsigned> payloadRings(plan.recvIndices.size(), 0);
+  SmallVector<uint64_t> ringBytes;
+  for (unsigned i = 0; i < plan.recvIndices.size(); ++i) {
+    // TransferCollector gives each receive its own sub-ring, numbered by its
+    // position on the destination tile.
+    assert(application.recvs[plan.recvIndices[i]].producerIdx == i &&
+           "receive producer index is not its position on the tile");
+    unsigned sliceIndex =
+        application.subslices[application.recvs[plan.recvIndices[i]].dstSubsliceIndex]
+            .sliceIndex;
+    bool first = true;
+    for (unsigned j = 0; j < i; ++j)
+      first &= application.subslices[application.recvs[plan.recvIndices[j]]
+                                         .dstSubsliceIndex]
+                   .sliceIndex != sliceIndex;
+    if (!first || isRecvInplaceEligible(application, plan, i) ||
+        !isSliceGatherEligible(application, plan, sliceIndex))
+      continue;
+    ringBytes.push_back(application.slices[sliceIndex].slotBytes);
+    for (unsigned j = i; j < plan.recvIndices.size(); ++j) {
+      const GeneratedRecv &recv = application.recvs[plan.recvIndices[j]];
+      if (application.subslices[recv.dstSubsliceIndex].sliceIndex == sliceIndex)
+        payloadRings[j] = ringBytes.size();
+    }
+  }
+  if (ringBytes.empty())
+    return;
+  plan.fifoPayloadRings = std::move(payloadRings);
+  plan.fifoSharedRingBytes = std::move(ringBytes);
+}
+
+void planGatheredFifoLayouts(MagiaApplicationDescription &application) {
+  if (application.target != "magia-v3")
+    return;
+  for (auto &[hartid, plan] : application.tilePlans)
+    planGatheredFifoLayout(application, plan);
+}
+
+static bool isGatheredSend(const MagiaApplicationDescription &application,
+                           const GeneratedSend &send) {
+  auto it = application.tilePlans.find(send.dstHartid);
+  if (it == application.tilePlans.end())
+    llvm_unreachable("send targets a tile without a plan");
+  const GeneratedTilePlan &plan = it->second;
+  return !plan.fifoPayloadRings.empty() &&
+         plan.fifoPayloadRings[send.producerIdx] != 0;
+}
+
 static void emitSendDesc(const MagiaApplicationDescription &application,
                          const GeneratedSend &send,
                          llvm::raw_ostream &os) {
@@ -390,6 +546,18 @@ static void emitSendDesc(const MagiaApplicationDescription &application,
   emitTensorSubSlice(dst.shape, dst.stridesBytes, os);
   os << ",\n";
   os << "    .producer_idx = " << send.producerIdx << ",\n";
+  if (application.target == "magia-v3") {
+    // Builds with MAPS_FIFO_INPLACE_RECV=0 ignore the shared payload rings.
+    bool gathered = isGatheredSend(application, send);
+    os << "    .dst_payload_mode = "
+       << (gathered ? "MAPS_FIFO_INPLACE_RECV ? FIFO_PAYLOAD_SHARED : "
+                      "FIFO_PAYLOAD_INLINE"
+                    : "FIFO_PAYLOAD_INLINE")
+       << ",\n";
+    os << "    .dst_offset_bytes = "
+       << (gathered ? computeOffsetBytes(dst.offset, dst.stridesBytes) : 0)
+       << "u,\n";
+  }
   os << "  }";
 }
 
@@ -453,6 +621,47 @@ static uint64_t getSubsliceL1Offset(const MagiaApplicationDescription &applicati
 static uint64_t getFifoSlotDataSize(const MagiaApplicationDescription &application,
                                     unsigned recvIndex);
 
+// Bytes of the magia-v3 variable FIFO layout or, with `shared`, of the shared
+// layout the runtime builds when the tile gathers slices in place (members keep
+// metadata-only slots, plus the payload map and shared rings).
+static void emitFifoVariantBytes(const MagiaApplicationDescription &application,
+                                 const GeneratedTilePlan &plan, bool shared,
+                                 llvm::raw_ostream &os) {
+  unsigned numProducers = plan.recvIndices.size();
+  os << "FIFO_HEADER_SIZE + " << numProducers
+     << "u * FIFO_RING_STATE_SIZE + " << numProducers + 1
+     << "u * FIFO_SLOT_OFFSET_SIZE";
+  for (unsigned i = 0; i < numProducers; ++i) {
+    uint64_t dataBytes = shared && plan.fifoPayloadRings[i] != 0
+                             ? 0
+                             : getFifoSlotDataSize(application, plan.recvIndices[i]);
+    os << " + MAPS_NUM_TOKEN_SLOTS * (FIFO_SLOT_META_SIZE + ((" << dataBytes
+       << "u + 3u) & ~3u))";
+  }
+  if (!shared)
+    return;
+  os << " + " << numProducers << "u * FIFO_PAYLOAD_RING_SIZE";
+  for (uint64_t bytes : plan.fifoSharedRingBytes)
+    os << " + MAPS_NUM_TOKEN_SLOTS * ((" << bytes << "u + 3u) & ~3u)";
+}
+
+// Bytes the magia-v3 FIFO takes on this tile.  Builds with
+// MAPS_FIFO_INPLACE_RECV=0 ignore the shared payload rings and build the
+// variable layout instead.
+static void emitFifoLayoutBytes(const MagiaApplicationDescription &application,
+                                const GeneratedTilePlan &plan,
+                                llvm::raw_ostream &os) {
+  if (plan.fifoSharedRingBytes.empty()) {
+    emitFifoVariantBytes(application, plan, /*shared=*/false, os);
+    return;
+  }
+  os << "(MAPS_FIFO_INPLACE_RECV ? (";
+  emitFifoVariantBytes(application, plan, /*shared=*/true, os);
+  os << ") : (";
+  emitFifoVariantBytes(application, plan, /*shared=*/false, os);
+  os << "))";
+}
+
 static void emitL1DataBaseOffset(const MagiaApplicationDescription &application,
                                  int64_t hartid, llvm::raw_ostream &os) {
   const GeneratedTilePlan &plan = application.tilePlans.find(hartid)->second;
@@ -467,12 +676,7 @@ static void emitL1DataBaseOffset(const MagiaApplicationDescription &application,
        << slotDataSize << "u + 3u) & ~3u))";
     return;
   }
-  os << "FIFO_HEADER_SIZE + " << plan.recvIndices.size()
-     << "u * FIFO_RING_STATE_SIZE + " << plan.recvIndices.size() + 1
-     << "u * FIFO_SLOT_OFFSET_SIZE";
-  for (unsigned recvIndex : plan.recvIndices)
-    os << " + MAPS_NUM_TOKEN_SLOTS * (FIFO_SLOT_META_SIZE + (("
-       << getFifoSlotDataSize(application, recvIndex) << "u + 3u) & ~3u))";
+  emitFifoLayoutBytes(application, plan, os);
 }
 
 static void emitOpDesc(const MagiaApplicationDescription &application,
@@ -676,6 +880,37 @@ static void emitFifoSlotDataSizes(const MagiaApplicationDescription &application
     os << getFifoSlotDataSize(application, plan.recvIndices[i]) << "u";
   }
   os << "};\n\n";
+
+  if (plan.fifoSharedRingBytes.empty())
+    return;
+  os << "static const uint32_t maps_application_tile_" << plan.hartid
+     << "_fifo_payload_rings[] = {";
+  for (unsigned i = 0; i < plan.fifoPayloadRings.size(); ++i)
+    os << (i != 0 ? ", " : "") << plan.fifoPayloadRings[i] << "u";
+  os << "};\n\n";
+  os << "static const uint32_t maps_application_tile_" << plan.hartid
+     << "_fifo_shared_ring_bytes[] = {";
+  for (unsigned i = 0; i < plan.fifoSharedRingBytes.size(); ++i)
+    os << (i != 0 ? ", " : "") << plan.fifoSharedRingBytes[i] << "u";
+  os << "};\n\n";
+
+  // Gathered slices must fit the runtime's slice alias table.
+  unsigned maxSliceId = 0;
+  for (unsigned i = 0; i < plan.recvIndices.size(); ++i)
+    if (plan.fifoPayloadRings[i] != 0)
+      maxSliceId = std::max(
+          maxSliceId,
+          application.slices[application.subslices
+                                 [application.recvs[plan.recvIndices[i]]
+                                      .dstSubsliceIndex]
+                                     .sliceIndex]
+              .sliceId);
+  os << "#if MAPS_FIFO_INPLACE_RECV\n";
+  os << "_Static_assert(" << maxSliceId
+     << "u < MAPS_ALIAS_MAX_SLICES && MAPS_APPLICATION_NUM_TOKEN_SLOTS <= "
+        "MAPS_ALIAS_MAX_SLOTS, \"gathered slices exceed the slice alias "
+        "table\");\n";
+  os << "#endif\n\n";
 }
 
 static void emitPlanArrayInitializer(StringRef fieldName, StringRef arraySuffix,
@@ -910,6 +1145,14 @@ void emitApplicationDataSource(const MagiaApplicationDescription &application,
   }
 }
 
+static void emitTileDescriptorL1Offset(const MagiaApplicationDescription &application,
+                                       const GeneratedTilePlan &plan,
+                                       llvm::raw_ostream &os) {
+  os << "((";
+  emitL1DataBaseOffset(application, plan.hartid, os);
+  os << " + " << plan.l1DataBytes << "u + 15u) & ~15u)";
+}
+
 static void emitApplicationTilePlanConstructor(
     const MagiaApplicationDescription &application, const GeneratedTilePlan &plan,
     llvm::raw_ostream &os) {
@@ -933,9 +1176,18 @@ static void emitApplicationTilePlanConstructor(
   os << "    .l1_offset_bytes = 0u,\n";
   os << "    .num_producers = " << plan.recvIndices.size() << "u,\n";
   os << "    .num_slots = MAPS_APPLICATION_NUM_TOKEN_SLOTS,\n";
-  if (application.target == "magia-v3" && !plan.recvIndices.empty())
+  if (application.target == "magia-v3" && !plan.recvIndices.empty()) {
     os << "    .slot_data_sizes = maps_application_tile_" << plan.hartid
        << "_fifo_slot_data_sizes,\n";
+    if (!plan.fifoSharedRingBytes.empty()) {
+      os << "    .payload_rings = maps_application_tile_" << plan.hartid
+         << "_fifo_payload_rings,\n";
+      os << "    .num_shared_rings = " << plan.fifoSharedRingBytes.size()
+         << "u,\n";
+      os << "    .shared_ring_bytes = maps_application_tile_" << plan.hartid
+         << "_fifo_shared_ring_bytes,\n";
+    }
+  }
   if (application.target != "magia-v3") {
     uint64_t slotDataSize = 0;
     for (unsigned recvIndex : plan.recvIndices)
@@ -958,7 +1210,32 @@ static void emitApplicationTilePlanConstructor(
                            plan.hartid, os);
   emitPlanArrayInitializer("l2_writes", "l2_writes",
                            plan.l2WriteIndices.size(), plan.hartid, os);
+  if (application.target == "magia-v3") {
+    // Descriptors are copied to L1 right after the planned slice data.
+    os << "  .descriptor_l1_offset = ";
+    emitTileDescriptorL1Offset(application, plan, os);
+    os << ",\n";
+  }
   os << "};\n";
+  if (application.target == "magia-v3") {
+    os << "\n_Static_assert(";
+    emitTileDescriptorL1Offset(application, plan, os);
+    auto addArray = [&](StringRef suffix, size_t count) {
+      if (count != 0)
+        os << " + ((sizeof(maps_application_tile_" << plan.hartid << "_"
+           << suffix << ") + 15u) & ~15u)";
+    };
+    addArray("slices", plan.sliceIndices.size());
+    addArray("init_l2_reads", plan.initL2ReadIndices.size());
+    addArray("l2_reads", plan.l2ReadIndices.size());
+    addArray("recvs", plan.recvIndices.size());
+    addArray("ops", plan.opIndices.size());
+    addArray("sends", plan.sendIndices.size());
+    addArray("l2_writes", plan.l2WriteIndices.size());
+    addArray("fifo_slot_data_sizes", plan.recvIndices.size());
+    os << " <= MAPS_V3_TASK_SCRATCH_OFFSET, "
+          "\"L1 descriptor copy overlaps task scratch\");\n";
+  }
 }
 
 void emitApplicationTileSource(const MagiaApplicationDescription &application,
@@ -1012,30 +1289,15 @@ void emitApplicationRunner(const MagiaApplicationDescription &application,
   os << "    maps_operation_runtime_t *runtime);\n\n";
   os << "int " << application.outputStem << "_run(void) {\n";
   os << "  const uint32_t hartid = get_hartid();\n";
-  os << "  idma_config_t idma_config = {.hartid = hartid};\n";
-  os << "  idma_controller_t idma = {\n";
-  os << "      .base = 0, .cfg = &idma_config, .api = &idma_api};\n";
-  os << "  redmule_config_t redmule_config = {.hartid = hartid};\n";
-  os << "  redmule_controller_t redmule = {\n";
-  os << "      .base = 0, .cfg = &redmule_config, .api = &redmule_api};\n";
-  os << "  fsync_config_t fsync_config = {.hartid = hartid};\n";
-  os << "  fsync_controller_t fsync = {\n";
-  os << "      .base = 0, .cfg = &fsync_config, .api = &fsync_api};\n";
-  os << "  eu_config_t eu_config = {.hartid = hartid};\n";
-  os << "  eu_controller_t event_unit = {\n";
-  os << "      .base = 0, .cfg = &eu_config, .api = &eu_api};\n\n";
-  os << "  idma_init(&idma);\n";
-  os << "  redmule_init(&redmule);\n";
-  os << "  fsync_init(&fsync);\n";
-  os << "  eu_init(&event_unit);\n";
+  os << "  idma_init();\n";
+  os << "  redmule_init();\n";
+  os << "  fsync_init();\n";
+  os << "  eu_init();\n";
   os << "  eu_clear_events(0xffffffffu);\n";
-  os << "  eu_fsync_init(&event_unit, 0u);\n";
-  os << "  eu_idma_init(&event_unit, 0u);\n";
-  os << "  eu_redmule_init(&event_unit, 0u);\n\n";
+  os << "  eu_fsync_init(0u);\n";
+  os << "  eu_idma_init(0u);\n";
+  os << "  eu_redmule_init(0u);\n\n";
   os << "  maps_operation_runtime_t runtime;\n";
-  os << "  runtime.idma_ctrl = &idma;\n";
-  os << "  runtime.redmule_ctrl = &redmule;\n";
-  os << "  runtime.eu_ctrl = &event_unit;\n";
   if (!spatzTasks.empty()) {
     os << "  runtime.kernel_abi_version = " << kGeneratedKernelAbiVersion
        << "u;\n";
@@ -1058,8 +1320,8 @@ void emitApplicationRunner(const MagiaApplicationDescription &application,
   }
   os << "  if (active)\n";
   os << "    maps_fifo_init(&plan);\n\n";
-  os << "  fsync_sync_level(&fsync, MAX_SYNC_LVL - 1, 0);\n";
-  os << "  eu_fsync_wait(&event_unit, " << uppercase(application.outputStem)
+  os << "  fsync_sync_level(MAX_SYNC_LVL - 1, 0);\n";
+  os << "  eu_fsync_wait(" << uppercase(application.outputStem)
      << "_WAIT_MODE);\n";
   os << "  " << application.outputStem << "_initialize_data(hartid);\n";
   os << "  if (hartid == 0u) {\n";
@@ -1067,20 +1329,24 @@ void emitApplicationRunner(const MagiaApplicationDescription &application,
      << uppercase(application.outputStem) << "_EXECUTION_TOKENS; ++token)\n";
   os << "      " << application.outputStem << "_handle_input(token);\n";
   os << "  }\n";
-  os << "  fsync_sync_global(&fsync);\n";
-  os << "  eu_fsync_wait(&event_unit, " << uppercase(application.outputStem)
+  os << "  fsync_sync_global();\n";
+  os << "  eu_fsync_wait(" << uppercase(application.outputStem)
      << "_WAIT_MODE);\n";
+  if (application.target == "magia-v3") {
+    os << "  if (active)\n";
+    os << "    maps_fifo_plan_to_l1(&plan);\n";
+  }
   os << "  if (active)\n";
-  os << "    maps_fifo_init_tile(&plan, &idma, &event_unit);\n";
-  os << "  fsync_sync_global(&fsync);\n";
-  os << "  eu_fsync_wait(&event_unit, " << uppercase(application.outputStem)
+  os << "    maps_fifo_init_tile(&plan);\n";
+  os << "  fsync_sync_global();\n";
+  os << "  eu_fsync_wait(" << uppercase(application.outputStem)
      << "_WAIT_MODE);\n";
   os << "  if (active)\n";
   os << "    maps_fifo_run_tile_tokens(\n";
   os << "        &plan, " << uppercase(application.outputStem)
-     << "_EXECUTION_TOKENS, &idma, &event_unit);\n";
-  os << "  fsync_sync_global(&fsync);\n";
-  os << "  eu_fsync_wait(&event_unit, " << uppercase(application.outputStem)
+     << "_EXECUTION_TOKENS);\n";
+  os << "  fsync_sync_global();\n";
+  os << "  eu_fsync_wait(" << uppercase(application.outputStem)
      << "_WAIT_MODE);\n";
   os << "  if (active)\n";
   os << "    maps_fifo_flush_experiment_trace(\n";
@@ -1158,7 +1424,7 @@ void emitApplicationCMake(const MagiaApplicationDescription &application,
       getRequiredSpatzTasks(application);
   os << "set(MAPS_APPLICATION " << application.outputStem << ")\n\n";
   if (!spatzTasks.empty()) {
-    os << "set(MAPS_SPATZ_KERNELS_DIR ${CMAKE_SOURCE_DIR}/kernels/spatz_fp16)\n";
+    os << "set(MAPS_SPATZ_KERNELS_DIR ${CMAKE_SOURCE_DIR}/kernels)\n";
     os << "add_spatz_task(\n";
     os << "  TEST_NAME ${MAPS_APPLICATION}\n";
     os << "  TASK_SOURCES\n";
