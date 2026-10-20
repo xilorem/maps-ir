@@ -155,7 +155,9 @@ getRequiredSpatzTasks(const MagiaApplicationDescription &application) {
   bool needsMatmul = false;
   bool needsRelu = false;
   bool needsSigmoid = false;
+  bool needsMaxPool = false;
   bool needsDepthwiseConv = false;
+  bool needsTranspose = false;
   bool needsSoftmaxExp = false;
   bool needsGroupReduce = false;
   bool needsGroupCenteredReduce = false;
@@ -165,7 +167,12 @@ getRequiredSpatzTasks(const MagiaApplicationDescription &application) {
   bool needsBinaryBcast = false;
   for (const GeneratedOp &op : application.ops) {
     needsSigmoid |= op.kind == GeneratedOpKind::Sigmoid;
+    needsMaxPool |= op.kind == GeneratedOpKind::MaxPool;
     needsDepthwiseConv |= op.kind == GeneratedOpKind::DepthwiseConv;
+    needsTranspose |= op.kind == GeneratedOpKind::Transpose &&
+                      !op.inputSubsliceIndices.empty() &&
+                      application.subslices[op.inputSubsliceIndices.front()]
+                          .elementType.isF16();
     if (op.deviceName != "spatz")
       continue;
     needsAdd |= op.kind == GeneratedOpKind::Add;
@@ -199,6 +206,16 @@ getRequiredSpatzTasks(const MagiaApplicationDescription &application) {
                      "matmul/fp16/spatz/spatz_task/matmul_rows_fp16_spatz_task.c", "matmul/fp16/spatz/include",
                      "MATMUL_ROWS_FP16_SPATZ_TASK", "matmul_fp16_task",
                      "MAPS_HAS_MATMUL_SPATZ_TASK"});
+  if (needsTranspose)
+    tasks.push_back({GeneratedOpKind::Transpose, "transpose_strided_fp16_spatz_task",
+                     "transpose/fp16/spatz/spatz_task/transpose_strided_fp16_spatz_task.c", "transpose/fp16/spatz/include",
+                     "TRANSPOSE_STRIDED_FP16_SPATZ_TASK", "transpose_fp16_task",
+                     "MAPS_HAS_TRANSPOSE_SPATZ_TASK"});
+  if (needsMaxPool)
+    tasks.push_back({GeneratedOpKind::MaxPool, "maxpool2d_fp16_spatz_task",
+                     "maxpool2d/fp16/spatz/spatz_task/maxpool2d_fp16_spatz_task.c", "maxpool2d/fp16/spatz/include",
+                     "MAXPOOL2D_FP16_SPATZ_TASK", "maxpool_fp16_task",
+                     "MAPS_HAS_MAXPOOL_SPATZ_TASK"});
   if (needsDepthwiseConv)
     tasks.push_back({GeneratedOpKind::DepthwiseConv, "depthwise_conv_fp16_spatz_task",
                      "depthwise_conv/fp16/spatz/spatz_task/depthwise_conv_fp16_spatz_task.c",

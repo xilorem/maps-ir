@@ -44,6 +44,7 @@ enum class GeneratedGlobalKind {
 enum class GeneratedOpKind {
   Matmul,
   Conv2D,
+  MaxPool,
   DepthwiseConv,
   Abs,
   Add,

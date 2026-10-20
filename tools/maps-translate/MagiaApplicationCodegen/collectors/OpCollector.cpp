@@ -32,6 +32,8 @@ static std::optional<GeneratedOpKind> getKernelOpKind(StringRef kind) {
     return GeneratedOpKind::Matmul;
   if (kind == "CONV2D")
     return GeneratedOpKind::Conv2D;
+  if (kind == "MAX_POOL")
+    return GeneratedOpKind::MaxPool;
   if (kind == "DEPTHWISE_CONV")
     return GeneratedOpKind::DepthwiseConv;
   if (kind == "ABS")

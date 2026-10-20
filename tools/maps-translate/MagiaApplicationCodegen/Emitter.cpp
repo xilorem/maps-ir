@@ -174,6 +174,8 @@ static StringRef getOpKindName(GeneratedOpKind kind) {
     return "OP_MATMUL";
   case GeneratedOpKind::Conv2D:
     return "OP_CONV2D";
+  case GeneratedOpKind::MaxPool:
+    return "OP_MAX_POOL";
   case GeneratedOpKind::DepthwiseConv:
     return "OP_DEPTHWISE_CONV";
   case GeneratedOpKind::Abs:

@@ -794,7 +794,7 @@ getDescriptorKernelKind(const llvm::json::Object &payload) {
         return kind;
 
     static constexpr StringLiteral supportedKinds[] = {
-        "ABS",          "ADD",          "DEPTHWISE_CONV", "DIV",
+        "MAX_POOL",     "ABS",          "ADD",          "DEPTHWISE_CONV", "DIV",
         "EXP",          "SOFTMAX_EXP",  "GROUP_NORMALIZE", "GROUP_REDUCE",
         "GROUP_CENTERED_REDUCE", "IM2COL", "OUTPUT_REFORMAT", "SPLIT", "LOG",
         "MATMUL",       "MUL",          "NEG",            "POW",
@@ -824,7 +824,16 @@ static std::optional<SmallVector<int64_t>>
 getDescriptorKernelParams(StringRef kind, const llvm::json::Object &payload) {
     SmallVector<int64_t> params;
 
-    if (kind == "IM2COL") {
+    if (kind == "MAX_POOL") {
+        auto kernel = parseIntArrayField(payload, "kernel_shape");
+        auto strides = parseIntArrayField(payload, "strides");
+        auto pads = parseIntArrayField(payload, "pads");
+        if (!kernel || kernel->size()!=2 || !strides || strides->size()!=2 || !pads || pads->size()!=4)
+            return std::nullopt;
+        params.append(*kernel);
+        params.append(*strides);
+        params.append(*pads);
+    } else if (kind == "IM2COL") {
         auto kernelShape = parseIntArrayField(payload, "kernel_shape");
         auto strides = parseIntArrayField(payload, "strides");
         auto dilations = parseIntArrayField(payload, "dilations");
@@ -977,7 +986,9 @@ static FailureOr<Value> emitDescriptorKernel(
         int64_t batchVolume = 1;
         int64_t matrixRows = lhsType.getShape()[lhsType.getRank() - 2];
         int64_t matrixDepth = lhsType.getShape()[lhsType.getRank() - 1];
-        int64_t matrixColumns = rhsType.getShape()[rhsType.getRank() - 1];
+        bool transposeW = payload->getBoolean("transpose_w").value_or(false);
+        int64_t matrixColumns =
+            rhsType.getShape()[rhsType.getRank() - (transposeW ? 2 : 1)];
         bool convOutput = outputType->getRank() == 4 && lhsType.getRank() == 2 &&
                           rhsType.getRank() == 2;
         if (convOutput) {
@@ -991,7 +1002,7 @@ static FailureOr<Value> emitDescriptorKernel(
         params->append(
             {matrixRows, matrixDepth, matrixColumns, batchVolume,
              batchVolume > 1, batchVolume > 1, convOutput,
-             payload && payload->getBoolean("transpose_w").value_or(false)});
+             transposeW});
     }
 
     OperationState state(loc, maps::KernelOp::getOperationName());
@@ -2333,7 +2344,7 @@ importExecutionPlanDocument(StringRef input, MLIRContext *ctx) {
                             ? (*nodeOutputs)[0].getAsObject()
                             : nullptr;
                     auto *output = (*outputs)[0].getAsObject();
-                    if (workKind == "DEPTHWISE_CONV") {
+                    if (workKind == "DEPTHWISE_CONV" || workKind == "MAX_POOL") {
                         auto kernel = output
                             ? emitDescriptorKernel(
                                   loc, *node, *layer, layerEntry.index(),
