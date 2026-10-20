@@ -258,7 +258,8 @@ static LogicalResult writeApplicationManifest(const MagiaApplicationDescription 
   llvm::json::Object memory{
       {"initializers_bytes", static_cast<int64_t>(application.weightsSize)},
       {"required_l2_bytes",
-       static_cast<int64_t>(application.nextL2Address - application.l2Base)},
+       static_cast<int64_t>(application.nextL2Address - application.l2Base +
+                            (application.target == "magia-v3" ? application.weightsSize : 0))},
       {"max_tile_l1_bytes", static_cast<int64_t>(maxTileDataBytes)},
   };
   if (application.target == "magia-v3") {

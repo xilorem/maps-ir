@@ -28,6 +28,7 @@ static constexpr unsigned kGeneratedOperationAbiVersion = 2;
 static constexpr unsigned kGeneratedDescriptorAbiVersion = 1;
 static constexpr unsigned kGeneratedKernelAbiVersion = 2;
 static constexpr unsigned kGeneratedTaskBundleVersion = 2;
+static constexpr uint64_t kMagiaV3L2BulkBytes = 0x0C000000ull;
 static constexpr uint64_t kMagiaL2Base = 0xCC010000ull;
 static constexpr uint64_t kMagiaL2End = 0xCCF10000ull;
 static constexpr uint64_t kGeneratedL2AlignmentBytes = 16ull;

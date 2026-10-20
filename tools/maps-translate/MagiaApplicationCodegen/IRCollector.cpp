@@ -82,17 +82,34 @@ static LogicalResult collectBundleMetadata(ModuleOp module,
   if (application.l2Base % application.weightsAlignment != 0)
     return failure();
 
+  uint64_t initializerCapacity = application.l2End - application.l2Base;
+  if (application.target == "magia-v3")
+    initializerCapacity = kMagiaV3L2BulkBytes;
   if (auto capacity = module->getAttrOfType<IntegerAttr>(
           "maps.l2_capacity_bytes")) {
     if (capacity.getInt() <= 0)
       return failure();
-    uint64_t configuredEnd = application.l2Base + capacity.getInt();
-    application.l2End = std::min(application.l2End, configuredEnd);
+    initializerCapacity = std::min(initializerCapacity,
+                                   static_cast<uint64_t>(capacity.getInt()));
+    if (application.target != "magia-v3") {
+      uint64_t configuredEnd = application.l2Base + capacity.getInt();
+      application.l2End = std::min(application.l2End, configuredEnd);
+    }
   }
-  if (application.weightsSize > application.l2End - application.l2Base)
+  if (application.weightsSize > initializerCapacity) {
+    llvm::errs() << "packed initializer image (" << application.weightsSize
+                 << " bytes) exceeds "
+                 << (application.target == "magia-v3" ? "L2 bulk" : "L2 allocation")
+                 << " capacity (" << initializerCapacity << " bytes)\n";
     return failure();
-  application.nextL2Address = alignTo(application.l2Base + application.weightsSize,
-                                kGeneratedL2AlignmentBytes);
+  }
+  // V3 initializers are emitted into .l2_bulk and addressed by ELF symbols.
+  // Its bounded application-data window contains only mutable runtime buffers.
+  // V2 retains its existing combined initializer/runtime allocation contract.
+  application.nextL2Address = application.target == "magia-v3"
+      ? application.l2Base
+      : alignTo(application.l2Base + application.weightsSize,
+                kGeneratedL2AlignmentBytes);
   return success();
 }
 

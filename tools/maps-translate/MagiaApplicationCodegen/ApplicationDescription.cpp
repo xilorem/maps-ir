@@ -441,8 +441,12 @@ LogicalResult getOrCreateL2Global(MagiaApplicationDescription &application,
 
   // Return error if memory is exceeded
   uint64_t allocationBytes = global.tokenStrideBytes * global.numTokens;
-  if (global.l2Address + allocationBytes > application.l2End)
+  if (global.l2Address + allocationBytes > application.l2End) {
+    llvm::errs() << "L2 runtime allocation for '" << globalName << "' needs "
+                 << allocationBytes << " bytes, exceeding remaining runtime capacity "
+                 << application.l2End - global.l2Address << " bytes\n";
     return failure();
+  }
 
   // set starting adress for next allocation
   application.nextL2Address = global.l2Address + allocationBytes;
